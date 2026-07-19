@@ -1,4 +1,9 @@
 { pkgs }:
 pkgs.mkShell {
-  packages = with pkgs; [ nixfmt statix deadnix nixd ];
+  packages = with pkgs; [
+    deadnix
+    nixd
+    nixfmt
+    statix
+  ];
 }
