@@ -2,7 +2,7 @@
   description = "Cross-project language/tool-specific devshells";
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
   outputs =
-    { nixpkgs }:
+    { nixpkgs, ... }:
     let
       system = "aarch64-darwin";
       pkgs = import nixpkgs { inherit system; };
