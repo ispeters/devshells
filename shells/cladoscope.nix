@@ -21,10 +21,7 @@ let
     doCheck = false;
   };
 
-  pythonEnv = pkgs.python3.withPackages (ps: [
-    ps.pytest
-    cladoscopePkg
-  ]);
+  pythonEnv = pkgs.python3.withPackages (ps: [ cladoscopePkg ]);
 in
 pkgs.mkShell {
   packages = [ pythonEnv ];
