@@ -1,10 +1,8 @@
 { pkgs, ... }:
 let
-  pythonEnv = pkgs.python3.withPackages (ps: [
-    ps.networkx
-    ps.libclang
-    ps.pytest
-  ]);
+  pythonEnv = pkgs.python3.withPackages (
+    ps: (import ../lib/cladoscope-python-deps.nix { inherit pkgs; }) ++ [ ps.pytest ]
+  );
 in
 pkgs.mkShell {
   packages = [ pythonEnv ];
