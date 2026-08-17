@@ -16,6 +16,7 @@ pkgs.mkShell {
       echo "cladoscope-dev: using local checkout at $CLADOSCOPE_DEV_REPO"
     else
       echo "cladoscope-dev: $CLADOSCOPE_DEV_REPO/src not found (set CLADOSCOPE_DEV_REPO to override)" >&2
+      exit 1;
     fi
   '';
 }
