@@ -1,4 +1,4 @@
-{ pkgs }:
+{ pkgs, ... }:
 let
   mkClangDevShell = import ../lib/mk-clang-dev-shell.nix { inherit pkgs; };
   mkLlvmReleaseTool = import ../lib/mk-llvm-release-tool.nix { inherit pkgs; };

@@ -1,8 +1,12 @@
 {
   description = "Cross-project language/tool-specific devshells";
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+  inputs.cladoscope = {
+    url = "github:ispeters/cladoscope";
+    flake = false; # it's a plain Python package repo, not itself a flake
+  };
   outputs =
-    { nixpkgs, ... }:
+    { nixpkgs, cladoscope, ... }:
     let
       system = "aarch64-darwin";
       pkgs = import nixpkgs { inherit system; };
@@ -13,7 +17,7 @@
     in
     {
       devShells.${system} = nixpkgs.lib.genAttrs names (
-        name: import ./shells/${name}.nix { inherit pkgs; }
+        name: import ./shells/${name}.nix { inherit pkgs cladoscope; }
       );
     };
 }
