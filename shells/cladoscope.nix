@@ -6,7 +6,10 @@ let
     src = cladoscope; # flake input, github:ispeters/cladoscope, pinned via flake.lock
     pyproject = true;
     build-system = with pkgs.python3Packages; [ setuptools ];
-    propagatedBuildInputs = with pkgs.python3Packages; [ networkx libclang ];
+    propagatedBuildInputs = with pkgs.python3Packages; [
+      networkx
+      libclang
+    ];
     # nixpkgs' python3Packages.libclang builds a wheel whose own metadata
     # declares its distribution name as "clang" (see its setup.cfg), not
     # "libclang" -- it's the bindings-only flavor, packaged under nixpkgs'

@@ -1,9 +1,11 @@
 {
   description = "Cross-project language/tool-specific devshells";
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
-  inputs.cladoscope = {
-    url = "github:ispeters/cladoscope";
-    flake = false; # it's a plain Python package repo, not itself a flake
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
+    cladoscope = {
+      url = "github:ispeters/cladoscope";
+      flake = false; # it's a plain Python package repo, not itself a flake
+    };
   };
   outputs =
     { nixpkgs, cladoscope, ... }:
