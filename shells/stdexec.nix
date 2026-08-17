@@ -8,8 +8,17 @@ let
     version = "21.1.5";
     hash = "sha256-3OZKcYSJeecSE9RrPCDKpsF4AiLszmb4LLmw0h7Sjjs";
   };
+
+  clangVersion = 22;
+  llvmPackages = pkgs."llvmPackages_${toString clangVersion}";
+
+  pythonEnv = pkgs.python3.withPackages (ps: [
+    ps.networkx
+    ps.libclang # bindings only (pinned ~21.x upstream); we point it at our own libclang.dylib below
+  ]);
 in
 mkClangDevShell {
+  inherit clangVersion;
   clangToolsOverride = {
     name = "clang-format";
     package = clang-format-21_1_5;
@@ -19,5 +28,9 @@ mkClangDevShell {
     gersemi
     lldb
     ninja
+    pythonEnv
   ];
+  extraShellHook = ''
+    export STDEXEC_LIBCLANG="${llvmPackages.libclang.lib}/lib/libclang.dylib"
+  '';
 }
