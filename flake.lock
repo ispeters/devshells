@@ -1,5 +1,21 @@
 {
   "nodes": {
+    "cladoscope": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1786818414,
+        "narHash": "sha256-LJXA0n5hCcx/7y/TRjAcrYgT+3YBb9pGenrzpqLxq84=",
+        "owner": "ispeters",
+        "repo": "cladoscope",
+        "rev": "f2849a1f56d81becb4366e0eec94fbd6a0c3a9c1",
+        "type": "github"
+      },
+      "original": {
+        "owner": "ispeters",
+        "repo": "cladoscope",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1784280462,
@@ -18,6 +34,7 @@
     },
     "root": {
       "inputs": {
+        "cladoscope": "cladoscope",
         "nixpkgs": "nixpkgs"
       }
     }
