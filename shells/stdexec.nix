@@ -9,7 +9,7 @@ let
     hash = "sha256-3OZKcYSJeecSE9RrPCDKpsF4AiLszmb4LLmw0h7Sjjs";
   };
 
-  clangVersion = 22;
+  clangVersion = 23;
   llvmPackages = pkgs."llvmPackages_${toString clangVersion}";
 
   pythonEnv = pkgs.python3.withPackages (ps: [
