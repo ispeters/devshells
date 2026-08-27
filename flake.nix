@@ -11,7 +11,10 @@
     { nixpkgs, cladoscope, ... }:
     let
       system = "aarch64-darwin";
-      pkgs = import nixpkgs { inherit system; };
+      pkgs = import nixpkgs {
+        inherit system;
+        overlays = [ (import ./lib/llvm23-overlay.nix) ];
+      };
       shellFiles = builtins.readDir ./shells;
       names = map (n: nixpkgs.lib.removeSuffix ".nix" n) (
         builtins.filter (n: shellFiles.${n} == "regular") (builtins.attrNames shellFiles)
