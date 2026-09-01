@@ -26,11 +26,20 @@ let
       };
 
   cachedClang = pkgs.writeShellScriptBin "clang" ''
-    exec ${pkgs.ccache}/bin/ccache ${llvmPackages.clang}/bin/clang "$@"
+    exec ${pkgs.ccache}/bin/ccache ${llvmPackages.libcxxClang}/bin/clang "$@"
   '';
   cachedClangxx = pkgs.writeShellScriptBin "clang++" ''
-    exec ${pkgs.ccache}/bin/ccache ${llvmPackages.clang}/bin/clang++ "$@"
+    exec ${pkgs.ccache}/bin/ccache ${llvmPackages.libcxxClang}/bin/clang++ "$@"
   '';
+  # NOTE: llvmPackages.clang deliberately means something different on Darwin
+  # than elsewhere: pkgs/development/compilers/llvm/common/default.nix binds
+  # it to `systemLibcxxClang` (libcxx = darwin.libcxx, i.e. Apple's ambient
+  # system libc++, tracking the host's Xcode/CLT/SDK) rather than this
+  # package set's own from-source libcxx. `libcxxClang` is the definition
+  # that's actually wired to `targetLlvmPackages.libcxx` -- the same one
+  # `libcxxStdenv.cc` (and hence plain `clang++` on PATH) already uses -- so
+  # this keeps $CC/$CXX consistent with the compiler the shell's own stdenv
+  # already resolves to, on every platform, not just Darwin.
 
   ccacheShellHook = pkgs.lib.optionalString enableCcache ''
     export CC="${cachedClang}/bin/clang"
@@ -61,6 +70,19 @@ pkgs.mkShell.override { stdenv = llvmPackages.libcxxStdenv; } {
 
   shellHook = ''
     export NIX_CFLAGS_COMPILE="$NIX_CFLAGS_COMPILE -B${llvmPackages.libcxx}/lib"
+    # clang-scan-deps (invoked directly by CMake/Ninja to scan C++20/23
+    # module dependencies, e.g. libc++'s std.cppm for `import std;`) bypasses
+    # cc-wrapper's flag injection entirely. Unlike clang++, nixpkgs does not
+    # currently wrap clang-scan-deps anywhere -- not even the copy bundled in
+    # `clang-tools` -- so it never sees the -isystem paths the real wrapped
+    # clang++ gets by default, and fails to find libc++ headers (e.g.
+    # 'text_encoding' file not found) even though a normal compile with the
+    # identical flags succeeds. This is a known, still-open nixpkgs bug:
+    # https://github.com/NixOS/nixpkgs/issues/452260
+    # https://github.com/NixOS/nixpkgs/pull/514323
+    # CPLUS_INCLUDE_PATH is a standard Clang/GCC search-path env var that
+    # clang-scan-deps *does* honor, since it doesn't depend on the wrapper.
+    export CPLUS_INCLUDE_PATH="${pkgs.lib.getDev llvmPackages.libcxx}/include/c++/v1''${CPLUS_INCLUDE_PATH:+:$CPLUS_INCLUDE_PATH}"
   ''
   + builtins.readFile ./debugserver-shellhook.sh
   + ccacheShellHook
