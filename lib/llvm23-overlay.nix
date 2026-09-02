@@ -89,7 +89,35 @@ final: prev: {
           rev-version = "23.1.0";
           sha256 = "sha256-Astfi1UDDcydyws3Q1sELqho/PxiNN/tvCtmCGj5FoE=";
         };
-      }).value
+      }).value.override {
+        # Build the instrumented toolchain *with* the from-source Clang 23,
+        # not with the default (LLVM 21) Darwin stdenv.
+        #
+        # LLVM_USE_SANITIZER=Address makes the build compile LLVM's own sources
+        # with -fsanitize=address, and the ASan runtime that gets linked in
+        # comes from whichever compiler performs that build. With the default
+        # stdenv that is compiler-rt 21.1.8, whose Darwin ASan runtime predates
+        # llvm/llvm-project#167797 ("[sanitizer_common] Add darwin-specific
+        # MemoryRangeIsAvailable", Nov 2025). The pre-#167797 runtime allocates
+        # while walking the memory map during InitializeShadowMemory
+        # (MemoryMappingLayout -> get_dyld_hdr -> dyld_shared_cache_iterate_text
+        # -> _Block_copy -> malloc), and since malloc is already interposed that
+        # re-enters AsanInitFromRtl on the same thread and spins forever on the
+        # non-recursive StaticSpinMutex. Symptom: *every* binary produced by the
+        # instrumented toolchain -- including `clang --version` itself -- hangs
+        # at 100% CPU before main, on macOS 26.
+        #
+        # Verified empirically: `otool -L` on the instrumented clang showed
+        # compiler-rt-libc-21.1.8's libclang_rt.asan_osx_dynamic.dylib, while an
+        # ASan hello-world built in the plain stdexec shell links
+        # compiler-rt-libc-23.1.0's and runs fine.
+        #
+        # `.override` (rather than an argument to mkLLVMPackages) is the
+        # supported channel here: mkPackage's argument set has no ellipsis, but
+        # common/default.nix takes `stdenv`, and nixpkgs documents
+        # `(llvmPackages.override { ... })` for exactly this.
+        stdenv = final.llvmPackages_23.libcxxStdenv;
+      }
     ).overrideScope
       (
         lFinal: lPrev:
@@ -116,14 +144,14 @@ final: prev: {
           # the same issue at the libc++.dylib boundary: the stdexec-asan
           # shell exports detect_container_overflow=0 by default.)
           #
-          # Benchmarks are dead weight here, and possibly harmful: the
-          # bundled google/benchmark's cxx_feature_check does a CMake
-          # try_run, i.e. it compiles AND EXECUTES a probe binary during
-          # configure, and under LLVM_USE_SANITIZER=Address that probe is
-          # itself instrumented. Nothing else in the build executes
-          # instrumented code: nixpkgs runs all build-time generators
-          # (LLVM_TABLEGEN, CLANG_TABLEGEN, ...) from the separate,
-          # uninstrumented buildLlvmPackages.tblgen, and doCheck is off.
+          # Benchmarks are off purely as dead weight: nothing here needs
+          # them, and google/benchmark's cxx_feature_check does a CMake
+          # try_run (it compiles and *executes* a probe binary during
+          # configure), which is a needless extra way for an instrumented
+          # binary to misbehave. NOTE: an earlier version of this file
+          # claimed that try_run was the cause of a configure hang. That was
+          # wrong -- the hang was the 21.1.8 ASan runtime deadlocking in
+          # every instrumented binary, fixed by the stdenv override above.
           libllvm = (instrument lPrev.libllvm).overrideAttrs (old: {
             cmakeFlags = old.cmakeFlags ++ [ "-DLLVM_INCLUDE_BENCHMARKS=OFF" ];
           });
