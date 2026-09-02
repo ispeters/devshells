@@ -52,4 +52,53 @@ final: prev: {
         libllvm = lPrev.libllvm.overrideAttrs (old: { doCheck = false; });
       }
     );
+
+  # ASan-instrumented variant of the same toolchain. The compiler *binaries*
+  # carry AddressSanitizer; code they compile is entirely unaffected. This is
+  # a diagnostic instrument for catching compiler-internal heap bugs (e.g.
+  # stale reads into freed deserialization state during BMI import), not a
+  # daily-driver toolchain: expect ~2x slower compiles and a from-scratch
+  # rebuild of the whole scope on first use, since everything downstream of
+  # the instrumented tools (compiler-rt, libcxx, ...) rebuilds too.
+  #
+  # Both libllvm and libclang are instrumented, deliberately uniformly:
+  # mixing instrumented and uninstrumented dylibs that pass libc++
+  # containers across their boundary invites container-annotation false
+  # positives. (Belt-and-suspenders for the same issue at the libc++.dylib
+  # boundary: run with ASAN_OPTIONS containing detect_container_overflow=0;
+  # the stdexec-asan shell exports that default.)
+  #
+  # LLVM_USE_SANITIZER is honored by the standalone clang build as well --
+  # both include HandleLLVMOptions.cmake, which implements it.
+  llvmPackages_23_asan = final.llvmPackages_23.overrideScope (
+    lFinal: lPrev:
+    let
+      instrument =
+        drv:
+        drv.overrideAttrs (old: {
+          cmakeFlags = (old.cmakeFlags or [ ]) ++ [ "-DLLVM_USE_SANITIZER=Address" ];
+          # Fortify's *_chk interposers fight ASan's interceptors; disabling
+          # all hardening is the standard practice for sanitized builds.
+          hardeningDisable = [ "all" ];
+          # No test suites under ASan: slow, and interceptor-related noise
+          # produces spurious failures unrelated to what we're hunting.
+          doCheck = false;
+        });
+    in
+    {
+      # Benchmarks are dead weight here, and actively harmful: benchmark's
+      # cxx_feature_check does a CMake try_run -- it compiles AND EXECUTES a
+      # probe binary during configure. With LLVM_USE_SANITIZER=Address in the
+      # global flags, that probe is ASan-instrumented, and ASan-instrumented
+      # binaries hang inside the Nix Darwin build sandbox (observed: configure
+      # stalls at benchmark's THREAD_SAFETY_ATTRIBUTES check). Nothing else in
+      # the build executes instrumented code: nixpkgs runs all build-time
+      # generators (LLVM_TABLEGEN, CLANG_TABLEGEN, ...) from the separate,
+      # uninstrumented buildLlvmPackages.tblgen package, and doCheck is off.
+      libllvm = (instrument lPrev.libllvm).overrideAttrs (old: {
+        cmakeFlags = old.cmakeFlags ++ [ "-DLLVM_INCLUDE_BENCHMARKS=OFF" ];
+      });
+      libclang = instrument lPrev.libclang;
+    }
+  );
 }
