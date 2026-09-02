@@ -53,6 +53,107 @@ final: prev: {
       }
     );
 
+  # Assertions-enabled variant of the same toolchain. Unlike the ASan scope,
+  # this changes *only* the compiler's own internal checking: it does not
+  # replace the allocator, add redzones, or quarantine freed memory, so it
+  # perturbs heap layout far less. That matters for hunting a
+  # layout-sensitive, nondeterministic crash whose reproduction rate is
+  # destroyed by allocator instrumentation -- an assertions build has a real
+  # chance of still reproducing it, and if an assertion fires on the
+  # corrupted state it yields a deterministic oracle plus a far better
+  # upstream report than a bare segfault.
+  #
+  # Same separate-instantiation reasoning as the ASan scope above: `name =
+  # "23_assert"` makes generateSplicesForMkScope bind buildLlvmPackages to
+  # this overlay attribute, so the flags actually reach the compiler the
+  # shell hands you.
+  #
+  # No stdenv override here. That was needed for ASan because the *runtime*
+  # linked into instrumented binaries comes from the building compiler;
+  # assertions add no runtime library, so the default stdenv is fine and
+  # keeps this build cheaper than the ASan one.
+  llvmPackages_23_assert =
+    (
+      (final.mkLLVMPackages {
+        name = "23_assert";
+        version = "23.1.0";
+        gitRelease = {
+          rev = "llvmorg-23.1.0";
+          rev-version = "23.1.0";
+          sha256 = "sha256-Astfi1UDDcydyws3Q1sELqho/PxiNN/tvCtmCGj5FoE=";
+        };
+      }).value
+    ).overrideScope
+      (
+        lFinal: lPrev:
+        let
+          # Assertions MUST be enabled uniformly across libllvm and libclang.
+          # HandleLLVMOptions.cmake sets LLVM_ENABLE_ABI_BREAKING_CHECKS=1
+          # when LLVM_ENABLE_ASSERTIONS is on and LLVM_ABI_BREAKING_CHECKS is
+          # WITH_ASSERTS (the default), and that flag changes data structure
+          # layouts. Mixing an asserts libclang against a no-asserts libLLVM
+          # is an ABI mismatch that manifests as its own crashes -- which
+          # would be indistinguishable from the bug under investigation.
+          withAssertions =
+            drv:
+            drv.overrideAttrs (old: {
+              cmakeFlags = (old.cmakeFlags or [ ]) ++ [ "-DLLVM_ENABLE_ASSERTIONS=ON" ];
+              # LLVM_ENABLE_ASSERTIONS also turns on standard-library
+              # hardening, adding -D_LIBCPP_HARDENING_MODE=..._EXTENSIVE.
+              # nixpkgs' cc-wrapper separately injects ..._FAST via its
+              # `libcxxhardeningfast` hardening flag, so both land on the
+              # command line with differing values and every TU warns
+              # -Wmacro-redefined. LLVM's -D comes later and wins, so the
+              # effective mode is EXTENSIVE either way -- but the warning is
+              # fatal wherever a subproject builds with -Werror. Drop the
+              # wrapper's flag so LLVM's intent stands unopposed.
+              #
+              # (The ASan scope avoids this collision only incidentally, via
+              # its broader hardeningDisable = [ "all" ].)
+              hardeningDisable = (old.hardeningDisable or [ ]) ++ [ "libcxxhardeningfast" ];
+              # LLVM's own test suite is not what we're here for, and
+              # assertions make it slower and noisier.
+              doCheck = false;
+            });
+        in
+        {
+          # LLVM_INCLUDE_BENCHMARKS=OFF is required here, not just tidy.
+          # LLVM_ENABLE_ASSERTIONS also switches on standard-library
+          # hardening (HandleLLVMOptions.cmake adds -D_GLIBCXX_ASSERTIONS and
+          # -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE), which
+          # collides with the _LIBCPP_HARDENING_MODE=..._FAST that nixpkgs'
+          # cc-wrapper already injects. The resulting -Wmacro-redefined is
+          # merely a warning throughout LLVM proper, but third-party/benchmark
+          # builds with BENCHMARK_ENABLE_WERROR=ON (its default) and so turns
+          # it into a hard error. Dropping the benchmarks removes the only
+          # -Werror consumer of the redefinition; -DBENCHMARK_ENABLE_WERROR=OFF
+          # would also work, but we have no use for the benchmarks here.
+          libllvm = (withAssertions lPrev.libllvm).overrideAttrs (old: {
+            cmakeFlags = old.cmakeFlags ++ [ "-DLLVM_INCLUDE_BENCHMARKS=OFF" ];
+          });
+
+          # See the plain llvmPackages_23 scope for the underlying bug.
+          # Only needed here, not on release-mode clang-unwrapped above: in
+          # a no-assertions build, TypeTraitExpr::getAPValue() on a
+          # value-dependent trait is incidentally well-defined (the trailing
+          # APValue slot is always allocated and already holds the same
+          # empty APValue this patch writes explicitly), so there's nothing
+          # to fix there. It only aborts once LLVM_ENABLE_ASSERTIONS is on --
+          # exactly this scope.
+          libclang = (withAssertions lPrev.libclang).overrideAttrs (old: {
+            patches = (old.patches or [ ]) ++ [
+              ./patches/0001-fix-typetraitexpr-value-dependent-serialization-assert.patch
+              # Knockout probe for the #191361-family crash: pre-sizes Sema's
+              # UnsubstitutedConstraintSatisfactionCache so DenseMap::grow()
+              # can't free the bucket array from inside a nested
+              # ConstraintSatisfactionChecker::Evaluate(). Inert unless
+              # CLANG_CONSTRAINT_CACHE_RESERVE is set in the environment.
+              ./patches/0002-diag-reserve-unsubstituted-constraint-satisfaction-cache.patch
+            ];
+          });
+        }
+      );
+
   # ASan-instrumented variant of the same toolchain. The compiler *binaries*
   # carry AddressSanitizer; code they compile is entirely unaffected. This is
   # a diagnostic instrument for catching compiler-internal heap bugs (e.g.
