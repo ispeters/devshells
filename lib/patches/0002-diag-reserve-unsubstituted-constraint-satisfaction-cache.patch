@@ -1,0 +1,74 @@
+From: Ian Petersen <ispeters@gmail.com>
+Subject: [PATCH] DIAGNOSTIC: env-gated reserve on UnsubstitutedConstraintSatisfactionCache
+
+NOT FOR UPSTREAM. Experimental knockout probe for the nondeterministic
+crash tracked at llvm/llvm-project#191361.
+
+malloc_history on an assertions build shows Sema's
+UnsubstitutedConstraintSatisfactionCache bucket array being freed by
+DenseMap::grow()'s moveFrom() from inside a *nested*
+ConstraintSatisfactionChecker::Evaluate(), while outer Evaluate frames
+are still live, and the freed range subsequently being reused for an
+ASTContext BumpPtrAllocator slab. Anything holding a pointer or
+reference into the bucket storage across that nested insert is left
+dangling.
+
+Pre-sizing the cache means grow() never fires mid-compile, removing
+that specific mechanism without perturbing the allocator globally
+(unlike scribble-on-free, which suppresses the crash but changes
+everything).
+
+The env var keeps control and treatment on one binary:
+  unset                              -> stock behaviour (control)
+  CLANG_CONSTRAINT_CACHE_RESERVE=1   -> default reserve of 1<<17 entries
+  CLANG_CONSTRAINT_CACHE_RESERVE=N   -> reserve N entries
+
+The observed freed bucket array was ~1.3 MiB, so 1<<17 entries is
+generous; if crashes persist, raise N before concluding the cache is
+exonerated.
+
+NOTE: paths in this diff are relative to the `clang/` subdirectory of
+the llvm-project monorepo, to match this repo's clang derivation's
+sourceRoot (clang-src-.../clang).
+---
+diff --git a/lib/Sema/Sema.cpp b/lib/Sema/Sema.cpp
+index 5a7dfb1..ee55507 100644
+--- a/lib/Sema/Sema.cpp
++++ b/lib/Sema/Sema.cpp
+@@ -76,6 +76,7 @@
+ #include "llvm/ADT/SetVector.h"
+ #include "llvm/ADT/SmallPtrSet.h"
+ #include "llvm/Support/TimeProfiler.h"
++#include <cstdlib>
+ #include <optional>
+ 
+ using namespace clang;
+@@ -358,6 +359,26 @@ Sema::Sema(Preprocessor &pp, ASTContext &ctxt, ASTConsumer &consumer,
+   SemaPPCallbackHandler->set(*this);
+ 
+   CurFPFeatures.setFPEvalMethod(PP.getCurrentFPEvalMethod());
++
++  // DIAGNOSTIC HOOK (downstream patch, not for upstream).
++  //
++  // Pre-size UnsubstitutedConstraintSatisfactionCache so that DenseMap::grow()
++  // never runs after this point. A rehash from inside a nested
++  // ConstraintSatisfactionChecker::Evaluate() frees the old bucket array while
++  // outer Evaluate frames are still running; the freed range is later reused
++  // for ASTContext bump-allocator slabs. Reserving up front removes that
++  // mechanism and nothing else.
++  //
++  // Gated on an env var so control and treatment runs share one binary:
++  //   unset -> stock behaviour
++  //   set   -> reserve (value parsed as an entry count; 0/garbage -> 1<<17)
++  if (const char *Env = std::getenv("CLANG_CONSTRAINT_CACHE_RESERVE")) {
++    unsigned long Entries = std::strtoul(Env, nullptr, 10);
++    if (Entries == 0)
++      Entries = 1ul << 17;
++    UnsubstitutedConstraintSatisfactionCache.reserve(
++        static_cast<unsigned>(Entries));
++  }
+ }
+ 
+ // Anchor Sema's type info to this TU.
+-- 
+2.43.0

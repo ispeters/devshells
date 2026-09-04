@@ -52,4 +52,211 @@ final: prev: {
         libllvm = lPrev.libllvm.overrideAttrs (old: { doCheck = false; });
       }
     );
+
+  # Assertions-enabled variant of the same toolchain. Unlike the ASan scope,
+  # this changes *only* the compiler's own internal checking: it does not
+  # replace the allocator, add redzones, or quarantine freed memory, so it
+  # perturbs heap layout far less. That matters for hunting a
+  # layout-sensitive, nondeterministic crash whose reproduction rate is
+  # destroyed by allocator instrumentation -- an assertions build has a real
+  # chance of still reproducing it, and if an assertion fires on the
+  # corrupted state it yields a deterministic oracle plus a far better
+  # upstream report than a bare segfault.
+  #
+  # Same separate-instantiation reasoning as the ASan scope above: `name =
+  # "23_assert"` makes generateSplicesForMkScope bind buildLlvmPackages to
+  # this overlay attribute, so the flags actually reach the compiler the
+  # shell hands you.
+  #
+  # No stdenv override here. That was needed for ASan because the *runtime*
+  # linked into instrumented binaries comes from the building compiler;
+  # assertions add no runtime library, so the default stdenv is fine and
+  # keeps this build cheaper than the ASan one.
+  llvmPackages_23_assert =
+    (
+      (final.mkLLVMPackages {
+        name = "23_assert";
+        version = "23.1.0";
+        gitRelease = {
+          rev = "llvmorg-23.1.0";
+          rev-version = "23.1.0";
+          sha256 = "sha256-Astfi1UDDcydyws3Q1sELqho/PxiNN/tvCtmCGj5FoE=";
+        };
+      }).value
+    ).overrideScope
+      (
+        lFinal: lPrev:
+        let
+          # Assertions MUST be enabled uniformly across libllvm and libclang.
+          # HandleLLVMOptions.cmake sets LLVM_ENABLE_ABI_BREAKING_CHECKS=1
+          # when LLVM_ENABLE_ASSERTIONS is on and LLVM_ABI_BREAKING_CHECKS is
+          # WITH_ASSERTS (the default), and that flag changes data structure
+          # layouts. Mixing an asserts libclang against a no-asserts libLLVM
+          # is an ABI mismatch that manifests as its own crashes -- which
+          # would be indistinguishable from the bug under investigation.
+          withAssertions =
+            drv:
+            drv.overrideAttrs (old: {
+              cmakeFlags = (old.cmakeFlags or [ ]) ++ [ "-DLLVM_ENABLE_ASSERTIONS=ON" ];
+              # LLVM_ENABLE_ASSERTIONS also turns on standard-library
+              # hardening, adding -D_LIBCPP_HARDENING_MODE=..._EXTENSIVE.
+              # nixpkgs' cc-wrapper separately injects ..._FAST via its
+              # `libcxxhardeningfast` hardening flag, so both land on the
+              # command line with differing values and every TU warns
+              # -Wmacro-redefined. LLVM's -D comes later and wins, so the
+              # effective mode is EXTENSIVE either way -- but the warning is
+              # fatal wherever a subproject builds with -Werror. Drop the
+              # wrapper's flag so LLVM's intent stands unopposed.
+              #
+              # (The ASan scope avoids this collision only incidentally, via
+              # its broader hardeningDisable = [ "all" ].)
+              hardeningDisable = (old.hardeningDisable or [ ]) ++ [ "libcxxhardeningfast" ];
+              # LLVM's own test suite is not what we're here for, and
+              # assertions make it slower and noisier.
+              doCheck = false;
+            });
+        in
+        {
+          # LLVM_INCLUDE_BENCHMARKS=OFF is required here, not just tidy.
+          # LLVM_ENABLE_ASSERTIONS also switches on standard-library
+          # hardening (HandleLLVMOptions.cmake adds -D_GLIBCXX_ASSERTIONS and
+          # -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE), which
+          # collides with the _LIBCPP_HARDENING_MODE=..._FAST that nixpkgs'
+          # cc-wrapper already injects. The resulting -Wmacro-redefined is
+          # merely a warning throughout LLVM proper, but third-party/benchmark
+          # builds with BENCHMARK_ENABLE_WERROR=ON (its default) and so turns
+          # it into a hard error. Dropping the benchmarks removes the only
+          # -Werror consumer of the redefinition; -DBENCHMARK_ENABLE_WERROR=OFF
+          # would also work, but we have no use for the benchmarks here.
+          libllvm = (withAssertions lPrev.libllvm).overrideAttrs (old: {
+            cmakeFlags = old.cmakeFlags ++ [ "-DLLVM_INCLUDE_BENCHMARKS=OFF" ];
+          });
+
+          # See the plain llvmPackages_23 scope for the underlying bug.
+          # Only needed here, not on release-mode clang-unwrapped above: in
+          # a no-assertions build, TypeTraitExpr::getAPValue() on a
+          # value-dependent trait is incidentally well-defined (the trailing
+          # APValue slot is always allocated and already holds the same
+          # empty APValue this patch writes explicitly), so there's nothing
+          # to fix there. It only aborts once LLVM_ENABLE_ASSERTIONS is on --
+          # exactly this scope.
+          libclang = (withAssertions lPrev.libclang).overrideAttrs (old: {
+            patches = (old.patches or [ ]) ++ [
+              ./patches/0001-fix-typetraitexpr-value-dependent-serialization-assert.patch
+              # Knockout probe for the #191361-family crash: pre-sizes Sema's
+              # UnsubstitutedConstraintSatisfactionCache so DenseMap::grow()
+              # can't free the bucket array from inside a nested
+              # ConstraintSatisfactionChecker::Evaluate(). Inert unless
+              # CLANG_CONSTRAINT_CACHE_RESERVE is set in the environment.
+              ./patches/0002-diag-reserve-unsubstituted-constraint-satisfaction-cache.patch
+            ];
+          });
+        }
+      );
+
+  # ASan-instrumented variant of the same toolchain. The compiler *binaries*
+  # carry AddressSanitizer; code they compile is entirely unaffected. This is
+  # a diagnostic instrument for catching compiler-internal heap bugs (e.g.
+  # stale reads into freed deserialization state during BMI import), not a
+  # daily-driver toolchain: expect slower compiles and a from-scratch build
+  # of the whole scope on first use.
+  #
+  # IMPORTANT: this is a *separate mkLLVMPackages instantiation*, not an
+  # `llvmPackages_23.overrideScope`. overrideScope rebinds only the scope's
+  # `self`, but the pieces that decide which compiler you actually get are
+  # reached through `buildLlvmPackages`, which common/default.nix binds to
+  # `otherSplices.selfBuildHost` -- fixed at makeScopeWithSplicing' time from
+  # the splices, never from `self`. In particular
+  #
+  #     libcxxStdenv = overrideCC stdenv buildLlvmPackages.libcxxClang;
+  #
+  # so an overrideScope-based variant silently hands back the *un*instrumented
+  # clang: the scope's own libclang is instrumented, but nothing the shell
+  # consumes refers to it. (Symptom: the build takes hours, then
+  # `ASAN_OPTIONS=help=1 clang++ --version` prints no option dump.)
+  #
+  # Instantiating with `name = "23_asan"` makes generateSplicesForMkScope
+  # generate splices for the attribute name `llvmPackages_23_asan`, so
+  # `buildLlvmPackages` resolves to *this* overlay attribute -- including the
+  # overrideScope layer below, since the attribute is bound to the whole
+  # expression. That closes the loop and makes the instrumentation stick.
+  llvmPackages_23_asan =
+    (
+      (final.mkLLVMPackages {
+        name = "23_asan";
+        version = "23.1.0";
+        gitRelease = {
+          rev = "llvmorg-23.1.0";
+          rev-version = "23.1.0";
+          sha256 = "sha256-Astfi1UDDcydyws3Q1sELqho/PxiNN/tvCtmCGj5FoE=";
+        };
+      }).value.override {
+        # Build the instrumented toolchain *with* the from-source Clang 23,
+        # not with the default (LLVM 21) Darwin stdenv.
+        #
+        # LLVM_USE_SANITIZER=Address makes the build compile LLVM's own sources
+        # with -fsanitize=address, and the ASan runtime that gets linked in
+        # comes from whichever compiler performs that build. With the default
+        # stdenv that is compiler-rt 21.1.8, whose Darwin ASan runtime predates
+        # llvm/llvm-project#167797 ("[sanitizer_common] Add darwin-specific
+        # MemoryRangeIsAvailable", Nov 2025). The pre-#167797 runtime allocates
+        # while walking the memory map during InitializeShadowMemory
+        # (MemoryMappingLayout -> get_dyld_hdr -> dyld_shared_cache_iterate_text
+        # -> _Block_copy -> malloc), and since malloc is already interposed that
+        # re-enters AsanInitFromRtl on the same thread and spins forever on the
+        # non-recursive StaticSpinMutex. Symptom: *every* binary produced by the
+        # instrumented toolchain -- including `clang --version` itself -- hangs
+        # at 100% CPU before main, on macOS 26.
+        #
+        # Verified empirically: `otool -L` on the instrumented clang showed
+        # compiler-rt-libc-21.1.8's libclang_rt.asan_osx_dynamic.dylib, while an
+        # ASan hello-world built in the plain stdexec shell links
+        # compiler-rt-libc-23.1.0's and runs fine.
+        #
+        # `.override` (rather than an argument to mkLLVMPackages) is the
+        # supported channel here: mkPackage's argument set has no ellipsis, but
+        # common/default.nix takes `stdenv`, and nixpkgs documents
+        # `(llvmPackages.override { ... })` for exactly this.
+        stdenv = final.llvmPackages_23.libcxxStdenv;
+      }
+    ).overrideScope
+      (
+        lFinal: lPrev:
+        let
+          instrument =
+            drv:
+            drv.overrideAttrs (old: {
+              cmakeFlags = (old.cmakeFlags or [ ]) ++ [ "-DLLVM_USE_SANITIZER=Address" ];
+              # Fortify's *_chk interposers fight ASan's interceptors;
+              # disabling all hardening is standard for sanitized builds.
+              hardeningDisable = [ "all" ];
+              # No test suites under ASan: slow, and interceptor-related
+              # noise produces failures unrelated to what we're hunting.
+              # (This also covers the sandboxed-codesign test that the
+              # plain llvmPackages_23 scope disables for the same reason.)
+              doCheck = false;
+            });
+        in
+        {
+          # Both libllvm and libclang are instrumented, deliberately
+          # uniformly: mixing instrumented and uninstrumented dylibs that
+          # pass libc++ containers across their boundary invites
+          # container-annotation false positives. (Belt-and-suspenders for
+          # the same issue at the libc++.dylib boundary: the stdexec-asan
+          # shell exports detect_container_overflow=0 by default.)
+          #
+          # Benchmarks are off purely as dead weight: nothing here needs
+          # them, and google/benchmark's cxx_feature_check does a CMake
+          # try_run (it compiles and *executes* a probe binary during
+          # configure), which is a needless extra way for an instrumented
+          # binary to misbehave. NOTE: an earlier version of this file
+          # claimed that try_run was the cause of a configure hang. That was
+          # wrong -- the hang was the 21.1.8 ASan runtime deadlocking in
+          # every instrumented binary, fixed by the stdenv override above.
+          libllvm = (instrument lPrev.libllvm).overrideAttrs (old: {
+            cmakeFlags = old.cmakeFlags ++ [ "-DLLVM_INCLUDE_BENCHMARKS=OFF" ];
+          });
+          libclang = instrument lPrev.libclang;
+        }
+      );
 }
