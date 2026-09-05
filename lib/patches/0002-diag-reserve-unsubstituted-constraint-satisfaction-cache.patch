@@ -1,49 +1,59 @@
 From: Ian Petersen <ispeters@gmail.com>
-Subject: [PATCH] DIAGNOSTIC: env-gated reserve on UnsubstitutedConstraintSatisfactionCache
+Subject: [PATCH] DIAGNOSTIC: env-gated reserve + instrumentation on UnsubstitutedConstraintSatisfactionCache
 
 NOT FOR UPSTREAM. Experimental knockout probe for the nondeterministic
 crash tracked at llvm/llvm-project#191361.
 
-malloc_history on an assertions build shows Sema's
-UnsubstitutedConstraintSatisfactionCache bucket array being freed by
-DenseMap::grow()'s moveFrom() from inside a *nested*
-ConstraintSatisfactionChecker::Evaluate(), while outer Evaluate frames
-are still live, and the freed range subsequently being reused for an
-ASTContext BumpPtrAllocator slab. Anything holding a pointer or
-reference into the bucket storage across that nested insert is left
-dangling.
+Supersedes the previous two versions of this patch.
 
-Pre-sizing the cache means grow() never fires mid-compile, removing
-that specific mechanism without perturbing the allocator globally
-(unlike scribble-on-free, which suppresses the crash but changes
-everything).
+  * The =1 arm reserves a single entry (DenseMap's 64-bucket floor) and
+    lets the map grow normally. This is deliberate and KEPT: it exercises
+    the same getenv/strtoul/reserve() path at a magnitude too small to
+    suppress anything, which isolates any observed effect to the reserve
+    size rather than to the presence of the hook. An earlier revision of
+    this patch documented =1 as selecting the default; that comment was
+    wrong (only 0 or an unparseable value does), and is now fixed.
 
-The env var keeps control and treatment on one binary:
-  unset                              -> stock behaviour (control)
-  CLANG_CONSTRAINT_CACHE_RESERVE=1   -> default reserve of 1<<17 entries
-  CLANG_CONSTRAINT_CACHE_RESERVE=N   -> reserve N entries
+  * Reports the cache's bucket footprint at construction and its peak
+    entry count plus footprint at end-of-TU, so the intervention is
+    observable rather than assumed. Equal "buckets=" figures mean
+    DenseMap::grow() never fired, i.e. the rehash-under-recursion
+    mechanism really was removed.
 
-The observed freed bucket array was ~1.3 MiB, so 1<<17 entries is
-generous; if crashes persist, raise N before concluding the cache is
-exonerated.
+    The end-of-TU report deliberately does NOT live in ~Sema(): the
+    driver passes -disable-free to cc1 by default, so Sema is never
+    destroyed in a normal compile and a destructor hook never runs. An
+    earlier revision made that mistake and silently produced no output.
+
+Both reports are gated on the env var and go to stderr, so rate-counting
+loops that discard stderr are unaffected. A crashing run aborts before
+end-of-TU, so take peak size from a successful run.
+
+Arms:
+  unset  -> stock behaviour (control)
+  =1     -> reserve 1 entry (no-op treatment; specificity control)
+  =N     -> reserve N entries
+  =0     -> reserve 1<<17 entries (~88 MB of buckets; a large heap
+            perturbation in its own right, hence the dose-response sweep)
 
 NOTE: paths in this diff are relative to the `clang/` subdirectory of
 the llvm-project monorepo, to match this repo's clang derivation's
 sourceRoot (clang-src-.../clang).
 ---
 diff --git a/lib/Sema/Sema.cpp b/lib/Sema/Sema.cpp
-index 5a7dfb1..ee55507 100644
+index 5a7dfb1..b02d581 100644
 --- a/lib/Sema/Sema.cpp
 +++ b/lib/Sema/Sema.cpp
-@@ -76,6 +76,7 @@
+@@ -76,6 +76,8 @@
  #include "llvm/ADT/SetVector.h"
  #include "llvm/ADT/SmallPtrSet.h"
  #include "llvm/Support/TimeProfiler.h"
++#include "llvm/Support/raw_ostream.h"
 +#include <cstdlib>
  #include <optional>
  
  using namespace clang;
-@@ -358,6 +359,26 @@ Sema::Sema(Preprocessor &pp, ASTContext &ctxt, ASTConsumer &consumer,
+@@ -358,6 +360,42 @@ Sema::Sema(Preprocessor &pp, ASTContext &ctxt, ASTConsumer &consumer,
    SemaPPCallbackHandler->set(*this);
  
    CurFPFeatures.setFPEvalMethod(PP.getCurrentFPEvalMethod());
@@ -54,21 +64,61 @@ index 5a7dfb1..ee55507 100644
 +  // never runs after this point. A rehash from inside a nested
 +  // ConstraintSatisfactionChecker::Evaluate() frees the old bucket array while
 +  // outer Evaluate frames are still running; the freed range is later reused
-+  // for ASTContext bump-allocator slabs. Reserving up front removes that
-+  // mechanism and nothing else.
++  // for ASTContext bump-allocator slabs.
 +  //
-+  // Gated on an env var so control and treatment runs share one binary:
-+  //   unset -> stock behaviour
-+  //   set   -> reserve (value parsed as an entry count; 0/garbage -> 1<<17)
++  // Gated on an env var so every arm shares one binary. NOTE the value
++  // semantics, which are what make the specificity control possible:
++  //
++  //   unset                             -> stock behaviour (control)
++  //   CLANG_CONSTRAINT_CACHE_RESERVE=1  -> reserve *one* entry: takes the same
++  //                                        branch and calls reserve(), but the
++  //                                        map grows normally afterwards, so
++  //                                        this is a no-op treatment arm
++  //   CLANG_CONSTRAINT_CACHE_RESERVE=N  -> reserve N entries
++  //   CLANG_CONSTRAINT_CACHE_RESERVE=0  -> reserve 1<<17 entries (the default;
++  //                                        0 and unparseable values land here)
++  //
++  // Reports go to stderr only when the variable is set, so the rate-counting
++  // loops (which discard stderr) are unaffected. Compare this "buckets="
++  // figure with the one reported at end-of-TU: if they are equal, grow()
++  // never fired and the rehash mechanism really was removed.
 +  if (const char *Env = std::getenv("CLANG_CONSTRAINT_CACHE_RESERVE")) {
 +    unsigned long Entries = std::strtoul(Env, nullptr, 10);
 +    if (Entries == 0)
 +      Entries = 1ul << 17;
 +    UnsubstitutedConstraintSatisfactionCache.reserve(
 +        static_cast<unsigned>(Entries));
++    llvm::errs() << "[constraint-cache] reserved " << Entries
++                 << " entries; buckets="
++                 << UnsubstitutedConstraintSatisfactionCache.getMemorySize()
++                 << " bytes\n";
 +  }
  }
  
  // Anchor Sema's type info to this TU.
+@@ -1718,6 +1756,23 @@ void Sema::ActOnEndOfTranslationUnit() {
+     TUScope = nullptr;
+ 
+   checkExposure(Context.getTranslationUnitDecl());
++
++  // DIAGNOSTIC HOOK (downstream patch, not for upstream). See the matching
++  // block in Sema's constructor.
++  //
++  // This deliberately lives here rather than in ~Sema(): the driver passes
++  // -disable-free to cc1 by default, so Sema is never destroyed in a normal
++  // compile and a destructor hook never fires. End-of-TU runs on every
++  // successful compile.
++  //
++  // "peak size" is the entry count to size a dose-response sweep around; an
++  // unchanged "buckets=" figure (vs. the constructor's) proves no rehash.
++  if (std::getenv("CLANG_CONSTRAINT_CACHE_RESERVE"))
++    llvm::errs() << "[constraint-cache] peak size="
++                 << UnsubstitutedConstraintSatisfactionCache.size()
++                 << "; buckets="
++                 << UnsubstitutedConstraintSatisfactionCache.getMemorySize()
++                 << " bytes\n";
+ }
+ 
+ 
 -- 
 2.43.0

@@ -149,6 +149,9 @@ final: prev: {
               # ConstraintSatisfactionChecker::Evaluate(). Inert unless
               # CLANG_CONSTRAINT_CACHE_RESERVE is set in the environment.
               ./patches/0002-diag-reserve-unsubstituted-constraint-satisfaction-cache.patch
+              ./patches/0003-diag-init-ics-trailing-template-args.patch
+              ./patches/0004-diag-census-ics-trailing-storage.patch
+              ./patches/0005-diag-probe-ics-in-window-reads.patch
             ];
           });
         }

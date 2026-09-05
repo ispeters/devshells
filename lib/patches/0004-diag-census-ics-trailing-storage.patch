@@ -1,0 +1,142 @@
+From: Ian Petersen <ispeters@gmail.com>
+Subject: [PATCH] DIAGNOSTIC: census the raw trailing storage of ImplicitConceptSpecializationDecl
+
+NOT FOR UPSTREAM. Companion probe to 0003, for llvm/llvm-project#191361.
+
+Applies on top of 0003 (same function, immediately before the value-init
+block, so the census observes the storage as the allocator left it).
+
+Purpose: rate measurements cannot distinguish "MallocPreScribble made the
+garbage harmless" from "MallocPreScribble never applied to this
+allocation." MallocPreScribble=1 did NOT move the crash rate, which the
+uninitialized-trailing-array mechanism says it should have -- an
+0xAA-filled array yields an invalid TemplateArgument kind, so
+StmtProfiler::VisitTemplateArgument would never reach VisitType. This
+patch looks at the bytes directly instead of inferring from rates.
+
+Each ImplicitConceptSpecializationDecl created by deserialization has its
+trailing array classified as all-zero / all-0xAA / all-0x55 / mixed, and
+a single line is printed at exit:
+
+  [ics-census] arrays=N zero=A aa=B 55=C mixed=D sizeof(TemplateArgument)=24 \
+      first-mixed-N=2 bytes=0100000010f662d30b00000001000000
+
+Expected, if the mechanism is right:
+
+  stock                 mostly zero, minority mixed (tracks the crash rate)
+  reserve(3072)         ~all zero (no rehash, so no dirty block to recycle)
+  MallocPreScribble=1   all aa if the knob applies here; unchanged if not
+  MallocScribble=1      all 55 if free-fill lands in the recycled slab;
+                        all zero would mean the knob suppresses by changing
+                        how large frees are recycled, not by neutering the
+                        garbage -- which would retire the
+                        freed-vs-uninitialized framing entirely
+
+Implementation notes: allocation-free by design (a heap allocation here
+would perturb the layout under investigation), so fixed-size statics and
+one stack byte. Reporting goes through atexit rather than Sema, so this
+patch touches no file other than DeclTemplate.cpp; a crashing run aborts
+and prints nothing, which is fine because census runs are successful ones.
+The byte-at-a-time memcpy is a deliberate way to read formally
+uninitialized storage; it is not a pattern for real code.
+
+NOTE: paths in this diff are relative to the `clang/` subdirectory of
+the llvm-project monorepo, to match this repo's clang derivation's
+sourceRoot (clang-src-.../clang).
+---
+diff --git a/lib/AST/DeclTemplate.cpp b/lib/AST/DeclTemplate.cpp
+index 8744c85..99574a6 100644
+--- a/lib/AST/DeclTemplate.cpp
++++ b/lib/AST/DeclTemplate.cpp
+@@ -35,6 +35,7 @@
+ #include "llvm/Support/raw_ostream.h"
+ #include <cassert>
+ #include <cstdlib>
++#include <cstring>
+ #include <memory>
+ #include <optional>
+ #include <utility>
+@@ -1157,6 +1158,81 @@ ImplicitConceptSpecializationDecl::CreateDeserialized(
+       new (C, ID, additionalSizeToAlloc<TemplateArgument>(NumTemplateArgs))
+           ImplicitConceptSpecializationDecl(EmptyShell{}, NumTemplateArgs);
+ 
++  // DIAGNOSTIC HOOK (downstream patch, not for upstream).
++  //
++  // Census what the trailing storage actually contains, BEFORE anything writes
++  // it. This exists to answer a specific question: do the allocator knobs
++  // (MallocPreScribble / MallocScribble) reach this storage at all? Rate
++  // measurements alone cannot distinguish "the fill made the garbage harmless"
++  // from "the fill never applied to this allocation."
++  //
++  // Reading uninitialized memory is formally UB; the byte-at-a-time memcpy is
++  // the practical way to look at it without inviting the optimizer to reason
++  // about it. Do not copy this pattern into real code.
++  //
++  // Deliberately allocation-free: a heap allocation here would perturb the very
++  // layout under investigation. Fixed-size statics and a stack byte only.
++  //
++  //   CLANG_ICS_CENSUS=1 -> classify each array, report once at exit
++  //
++  // The report is registered with atexit rather than hung off Sema, so this
++  // patch touches no other file. A crashing run aborts and prints nothing --
++  // census runs are meant to be successful ones.
++  if (NumTemplateArgs && std::getenv("CLANG_ICS_CENSUS")) {
++    static unsigned long long Total = 0, Zero = 0, ScribAA = 0, Scrib55 = 0,
++                              Mixed = 0;
++    static unsigned char Sample[24];
++    static unsigned SampleN = 0;
++    static bool Registered = false;
++
++    if (!Registered) {
++      Registered = true;
++      std::atexit([] {
++        llvm::errs() << "[ics-census] arrays=" << Total << " zero=" << Zero
++                     << " aa=" << ScribAA << " 55=" << Scrib55
++                     << " mixed=" << Mixed << " sizeof(TemplateArgument)="
++                     << sizeof(TemplateArgument);
++        if (SampleN) {
++          static const char Hex[] = "0123456789abcdef";
++          llvm::errs() << " first-mixed-N=" << SampleN << " bytes=";
++          for (unsigned I = 0; I != sizeof(Sample); ++I)
++            llvm::errs() << Hex[Sample[I] >> 4] << Hex[Sample[I] & 0xf];
++        }
++        llvm::errs() << "\n";
++      });
++    }
++
++    const auto *Bytes =
++        reinterpret_cast<const unsigned char *>(Result->getTrailingObjects());
++    const size_t NumBytes =
++        size_t(NumTemplateArgs) * sizeof(TemplateArgument);
++
++    bool AllZero = true, AllAA = true, All55 = true;
++    for (size_t I = 0; I != NumBytes; ++I) {
++      unsigned char B;
++      std::memcpy(&B, Bytes + I, 1);
++      AllZero &= (B == 0x00);
++      AllAA &= (B == 0xAA);
++      All55 &= (B == 0x55);
++    }
++
++    ++Total;
++    if (AllZero)
++      ++Zero;
++    else if (AllAA)
++      ++ScribAA;
++    else if (All55)
++      ++Scrib55;
++    else {
++      ++Mixed;
++      if (!SampleN) {
++        std::memcpy(Sample, Bytes,
++                    NumBytes < sizeof(Sample) ? NumBytes : sizeof(Sample));
++        SampleN = NumTemplateArgs;
++      }
++    }
++  }
++
+   // DIAGNOSTIC HOOK (downstream patch, not for upstream).
+   //
+   // The trailing TemplateArgument array is left as raw storage here; it is
+-- 
+2.43.0
