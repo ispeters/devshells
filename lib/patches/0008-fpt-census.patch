@@ -1,39 +1,51 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ian Petersen <ispeters@gmail.com>
-Date: Sun, 6 Sep 2026 17:56:47 +0000
-Subject: [PATCH] [DIAGNOSTIC 0008] Census canonical computed-noexcept
- FunctionProtoTypes
+Subject: [PATCH] DIAGNOSTIC: census FunctionProtoType lookups, builds and provisional keys
 
-Not for upstream. Instrumentation for llvm/llvm-project#191361.
+NOT FOR UPSTREAM.  Instrumentation for llvm/llvm-project#191361.
 
-Records every canonical FunctionProtoType with a computed noexcept
-specification created in this process, grouped by a shallow key that covers
-result type, parameter types, exception-spec kind and variadicness, but
-deliberately excludes the deep profile of the noexcept expression itself.
+Logs computed-noexcept FunctionProtoType lookups and constructions, and
+whether the FoldingSetNodeID was computed while an
+ImplicitConceptSpecializationDecl's trailing arguments were still unwritten
+(PROVISIONAL-KEY).
 
-Canonical types are the level at which two derivations of one function type
-must converge on a single object, and for EST_DependentNoexcept the deep
-Expr profile is the only thing that can make them converge -- the noexcept
-Expr pointers differ when one derivation comes from a BMI and the other from
-Sema. So two entries in one group is exactly the mis-uniquing that a profile
-computed over an unwritten ImplicitConceptSpecializationDecl argument array
-would produce.
+This version is sized for running over a whole build and grepping:
 
-Prints one [fpt] line per canonical computed-noexcept type created, so that a
-run with no duplicates can be distinguished from a run in which the situation
-never arose, and one [fpt-dup] line when a group grows past one.
+  CLANG_FPT_CENSUS=1  quiet -- only provisional lookups/builds, [fpt-bad-*],
+                      canonical-only [fpt-dup], one "tu=" line per TU, and
+                      the summary.
+  CLANG_FPT_CENSUS=2  verbose -- every computed-noexcept lookup and build,
+                      as before.
 
-Gated on CLANG_FPT_CENSUS; CLANG_FPT_CENSUS_NAMES additionally prints the
-named concept of the noexcept expression, which dereferences a ConceptDecl and
-is therefore off by default.
+The summary now breaks provisional keys down by exception-spec kind.
+provisional-est6= is the number to look for: EST_DependentNoexcept is the only
+kind whose noexcept expression survives into the canonical type's key, so it
+is the only kind for which a provisional key can produce two canonical types
+for one function type.  For EST_NoexceptTrue/False (est=8/7) the canonical
+form is EST_BasicNoexcept/EST_None with no expression profiled, and a bad key
+can only affect a sugar node.  A new [fpt-bad-dependent] line fires on any
+est=6 provisional lookup so it is greppable without reading the summary.
+
+Every line carries depth= from an RAII frame at getFunctionTypeInternal entry,
+so the recursive OnlyWantCanonical call is visibly nested.  Built lines carry
+est=, is-canonical= and canonical-null=.  [fpt-dup] fires only when more than
+one node in a shallow-key group is its own canonical form.
+
+Gated on CLANG_FPT_CENSUS.  CLANG_FPT_CENSUS_NAMES additionally prints type
+spellings and the named concept; those run the TypePrinter and dereference a
+ConceptDecl from inside the deserialization window, so they are off by default.
+
+NOTE: paths in this diff are relative to the `clang/` subdirectory of the
+llvm-project monorepo, to match this repo's clang derivation's sourceRoot.
+Applies on top of 0003-0007; noteUnpopulatedRead() is introduced by 0005.
 ---
- clang/lib/AST/ASTContext.cpp | 81 ++++++++++++++++++++++++++++++++++++
- 1 file changed, 81 insertions(+)
+ lib/AST/ASTContext.cpp   | 235 ++++++++++++++++++++++++++++++++++++++-
+ lib/AST/DeclTemplate.cpp |  12 ++
+ 2 files changed, 245 insertions(+), 2 deletions(-)
 
-diff --git a/clang/lib/AST/ASTContext.cpp b/clang/lib/AST/ASTContext.cpp
-index 2228811..7f900db 100644
---- a/clang/lib/AST/ASTContext.cpp
-+++ b/clang/lib/AST/ASTContext.cpp
+diff --git a/lib/AST/ASTContext.cpp b/lib/AST/ASTContext.cpp
+index 2228811..32baf16 100644
+--- a/lib/AST/ASTContext.cpp
++++ b/lib/AST/ASTContext.cpp
 @@ -33,6 +33,7 @@
  #include "clang/AST/DependenceFlags.h"
  #include "clang/AST/Expr.h"
@@ -50,80 +62,219 @@ index 2228811..7f900db 100644
  #include "llvm/ADT/DenseSet.h"
  #include "llvm/ADT/FoldingSet.h"
  #include "llvm/ADT/PointerUnion.h"
-@@ -5049,6 +5051,80 @@ static bool isCanonicalExceptionSpecification(
+@@ -5049,6 +5051,219 @@ static bool isCanonicalExceptionSpecification(
    return false;
  }
  
 +//===----------------------------------------------------------------------===//
-+// CLANG_FPT_CENSUS: temporary instrumentation for llvm/llvm-project#191361.
++// CLANG_FPT_CENSUS: instrumentation for llvm/llvm-project#191361.
 +//
-+// Records every *canonical* FunctionProtoType with a computed noexcept
-+// specification that this process creates, keyed on everything about the type
-+// except the noexcept expression itself. Two canonical types landing in the
-+// same group means the deep Expr profile failed to unique them: the two
-+// derivations of one type were filed under different FoldingSet keys.
++// Logs computed-noexcept FunctionProtoType lookups and constructions, and
++// whether the FoldingSetNodeID was computed while an
++// ImplicitConceptSpecializationDecl's trailing arguments were still unwritten
++// (PROVISIONAL-KEY).
 +//
-+// Inert unless CLANG_FPT_CENSUS is set in the environment.
++//   CLANG_FPT_CENSUS=1   quiet: provisional lookups/builds, [fpt-bad-*],
++//                        canonical-only [fpt-dup], one tu= line, and the
++//                        summary.  Sized for grepping a whole build.
++//   CLANG_FPT_CENSUS=2   verbose: every computed-noexcept lookup and build.
++//   CLANG_FPT_CENSUS_NAMES=1  add type spellings and the named concept; runs
++//                        the TypePrinter inside the deserialization window, so
++//                        off by default.
++//
++// The summary's provisional-est6= counter is the one that matters: a
++// provisional key on an EST_DependentNoexcept type is the only case in which
++// the noexcept expression survives into the canonical type's key.  For
++// EST_NoexceptTrue/False the canonical form is EST_BasicNoexcept/EST_None and
++// the expression is not profiled at all, so a bad key there can only affect a
++// sugar node.
 +//===----------------------------------------------------------------------===//
++namespace clang {
++extern unsigned long ClangICSUnpopulatedReadCount;
++} // namespace clang
++
++static unsigned FPTCensusDepth = 0;
++
 +namespace {
++struct FPTCensusFrame {
++  FPTCensusFrame() { ++FPTCensusDepth; }
++  ~FPTCensusFrame() { --FPTCensusDepth; }
++};
++
 +struct FPTCensusState {
-+  bool Enabled;
++  unsigned Level;
 +  bool Names;
-+  unsigned NumCanonical = 0;
++  bool PrintedTU = false;
++  unsigned NumLookups = 0;
++  unsigned NumBuilt = 0;
++  unsigned NumProvisional = 0;
++  unsigned NumProvisionalByEST[16] = {};
++  unsigned NumProvisionalHits = 0;
++  unsigned NumProvisionalCanonical = 0;
++  unsigned NumCanonicalDups = 0;
 +  llvm::StringMap<llvm::SmallVector<const FunctionProtoType *, 2>> Groups;
 +
-+  FPTCensusState()
-+      : Enabled(::getenv("CLANG_FPT_CENSUS") != nullptr),
-+        Names(::getenv("CLANG_FPT_CENSUS_NAMES") != nullptr) {}
++  FPTCensusState() : Names(::getenv("CLANG_FPT_CENSUS_NAMES") != nullptr) {
++    const char *E = ::getenv("CLANG_FPT_CENSUS");
++    Level = E ? (unsigned)std::strtoul(E, nullptr, 10) : 0;
++    if (E && Level == 0)
++      Level = 1;
++  }
++
++  ~FPTCensusState() {
++    if (!Level)
++      return;
++    llvm::errs() << "[fpt] summary lookups=" << NumLookups
++                 << " built=" << NumBuilt
++                 << " provisional-keys=" << NumProvisional
++                 << " provisional-est6=" << NumProvisionalByEST[6]
++                 << " provisional-est7=" << NumProvisionalByEST[7]
++                 << " provisional-est8=" << NumProvisionalByEST[8]
++                 << " provisional-hits=" << NumProvisionalHits
++                 << " provisional-canonical-nodes=" << NumProvisionalCanonical
++                 << " canonical-dups=" << NumCanonicalDups << '\n';
++  }
 +};
 +} // namespace
 +
-+static FPTCensusState &getFPTCensusState() {
++static FPTCensusState &fptCensus() {
 +  static FPTCensusState S;
 +  return S;
 +}
 +
-+static void censusCanonicalComputedNoexceptType(
-+    const FunctionProtoType *FTP, QualType ResultTy, ArrayRef<QualType> ArgArray,
-+    const FunctionProtoType::ExtProtoInfo &EPI) {
-+  FPTCensusState &S = getFPTCensusState();
-+  if (!S.Enabled)
++static bool fptCensusEnabled() { return fptCensus().Level != 0; }
++static bool fptCensusVerbose() { return fptCensus().Level >= 2; }
++
++static void fptCensusTU(const ASTContext &Ctx) {
++  FPTCensusState &S = fptCensus();
++  if (S.PrintedTU)
 +    return;
++  S.PrintedTU = true;
++  llvm::errs() << "[fpt] tu=";
++  if (auto FE = Ctx.getSourceManager().getFileEntryRefForID(
++          Ctx.getSourceManager().getMainFileID()))
++    llvm::errs() << FE->getName();
++  else
++    llvm::errs() << "<unknown>";
++  llvm::errs() << '\n';
++}
 +
-+  // Shallow key: identical to FunctionProtoType::Profile's contribution for
-+  // everything that is compared by pointer, minus the deep profile of the
-+  // noexcept expression. These are canonical types, so the parameter and
-+  // result type pointers are directly comparable between derivations.
++// Shallow identity: everything FunctionProtoType::Profile compares by pointer,
++// minus the deep profile of the noexcept expression. This groups a canonical
++// node together with its sugar nodes on purpose; [fpt-dup] fires only when more
++// than one member of a group is its own canonical form.
++static std::string fptShallowKey(QualType ResultTy, ArrayRef<QualType> ArgArray,
++                                 const FunctionProtoType::ExtProtoInfo &EPI) {
 +  std::string Key;
-+  {
-+    llvm::raw_string_ostream OS(Key);
-+    OS << ResultTy.getAsOpaquePtr();
-+    for (QualType A : ArgArray)
-+      OS << ',' << A.getAsOpaquePtr();
-+    OS << '/' << unsigned(EPI.ExceptionSpec.Type) << '/' << EPI.Variadic;
++  llvm::raw_string_ostream OS(Key);
++  OS << ResultTy.getCanonicalType().getAsOpaquePtr();
++  for (QualType A : ArgArray)
++    OS << ',' << A.getCanonicalType().getAsOpaquePtr();
++  OS << '/' << unsigned(EPI.ExceptionSpec.Type) << '/' << EPI.Variadic;
++  return Key;
++}
++
++static void fptCensusNames(QualType ResultTy, ArrayRef<QualType> ArgArray,
++                           const FunctionProtoType::ExtProtoInfo &EPI) {
++  if (!fptCensus().Names)
++    return;
++  llvm::errs() << "\n         ret=" << ResultTy.getAsString();
++  for (QualType A : ArgArray)
++    llvm::errs() << "\n         arg=" << A.getAsString();
++  if (const auto *CSE = dyn_cast_or_null<ConceptSpecializationExpr>(
++          EPI.ExceptionSpec.NoexceptExpr))
++    llvm::errs() << "\n         concept=" << CSE->getNamedConcept()->getName();
++}
++
++static void fptCensusLookup(const ASTContext &Ctx, const FunctionProtoType *Found,
++                            bool Provisional, bool OnlyWantCanonical,
++                            QualType ResultTy, ArrayRef<QualType> ArgArray,
++                            const FunctionProtoType::ExtProtoInfo &EPI) {
++  FPTCensusState &S = fptCensus();
++  ++S.NumLookups;
++  unsigned EST = unsigned(EPI.ExceptionSpec.Type);
++  if (Provisional) {
++    ++S.NumProvisional;
++    if (EST < 16)
++      ++S.NumProvisionalByEST[EST];
++    if (Found)
++      ++S.NumProvisionalHits;
 +  }
 +
-+  auto &Group = S.Groups[Key];
-+  Group.push_back(FTP);
-+  ++S.NumCanonical;
++  if (!fptCensusVerbose() && !Provisional)
++    return;
++  fptCensusTU(Ctx);
 +
-+  llvm::errs() << "[fpt] canonical computed-noexcept type #" << S.NumCanonical
-+               << " ptr=" << (const void *)FTP << " nparams=" << ArgArray.size()
-+               << " est=" << unsigned(EPI.ExceptionSpec.Type)
-+               << " noexcept-expr=" << (const void *)EPI.ExceptionSpec.NoexceptExpr
-+               << " group-size=" << Group.size();
-+  if (S.Names) {
-+    if (const auto *CSE = dyn_cast_or_null<ConceptSpecializationExpr>(
-+            EPI.ExceptionSpec.NoexceptExpr))
-+      llvm::errs() << " concept=" << CSE->getNamedConcept()->getName();
-+  }
++  llvm::errs() << "[fpt] depth=" << FPTCensusDepth << " lookup #" << S.NumLookups
++               << (Found ? " HIT" : " MISS")
++               << (Provisional ? " PROVISIONAL-KEY" : "")
++               << (OnlyWantCanonical ? " only-canonical" : "")
++               << " est=" << EST << " nparams=" << ArgArray.size()
++               << " noexcept-expr="
++               << (const void *)EPI.ExceptionSpec.NoexceptExpr;
++  if (Found)
++    llvm::errs() << " found=" << (const void *)Found << " found-noexcept-expr="
++                 << (const void *)Found->getNoexceptExpr();
++  fptCensusNames(ResultTy, ArgArray, EPI);
 +  llvm::errs() << '\n';
 +
-+  if (Group.size() > 1) {
-+    llvm::errs() << "[fpt-dup] " << Group.size()
++  if (Found && Provisional)
++    llvm::errs() << "[fpt-bad-hit] a provisional key matched an existing node; "
++                    "this type adopts that node's canonical type\n";
++  if (Provisional && EST == EST_DependentNoexcept)
++    llvm::errs() << "[fpt-bad-dependent] a provisional key was computed for an "
++                    "EST_DependentNoexcept type; the expression is part of its "
++                    "canonical identity\n";
++}
++
++static void fptCensusBuilt(const ASTContext &Ctx, const FunctionProtoType *FTP,
++                           bool Provisional, bool IsCanonicalLocal,
++                           bool CanonicalNull, bool OnlyWantCanonical,
++                           QualType ResultTy, ArrayRef<QualType> ArgArray,
++                           const FunctionProtoType::ExtProtoInfo &EPI) {
++  FPTCensusState &S = fptCensus();
++  ++S.NumBuilt;
++  if (Provisional && CanonicalNull)
++    ++S.NumProvisionalCanonical;
++
++  auto &Group = S.Groups[fptShallowKey(ResultTy, ArgArray, EPI)];
++  Group.push_back(FTP);
++
++  unsigned NumCanonical = 0;
++  for (const FunctionProtoType *P : Group)
++    if (P->isCanonicalUnqualified())
++      ++NumCanonical;
++  bool Dup = NumCanonical > 1;
++  if (Dup)
++    ++S.NumCanonicalDups;
++
++  if (!fptCensusVerbose() && !Provisional && !Dup)
++    return;
++  fptCensusTU(Ctx);
++
++  llvm::errs() << "[fpt] depth=" << FPTCensusDepth << " built #" << S.NumBuilt
++               << " ptr=" << (const void *)FTP
++               << (CanonicalNull ? " canonical" : " sugar")
++               << (Provisional ? " PROVISIONAL-KEY" : "")
++               << (OnlyWantCanonical ? " only-canonical" : "")
++               << " is-canonical=" << IsCanonicalLocal
++               << " canonical-null=" << CanonicalNull
++               << " est=" << unsigned(EPI.ExceptionSpec.Type)
++               << " nparams=" << ArgArray.size() << " noexcept-expr="
++               << (const void *)EPI.ExceptionSpec.NoexceptExpr
++               << " group-size=" << Group.size();
++  fptCensusNames(ResultTy, ArgArray, EPI);
++  llvm::errs() << '\n';
++
++  if (Provisional && CanonicalNull)
++    llvm::errs() << "[fpt-bad-canonical] a canonical node was filed under a "
++                    "provisional key\n";
++  if (Dup) {
++    llvm::errs() << "[fpt-dup] " << NumCanonical
 +                 << " canonical types share one shallow key:";
 +    for (const FunctionProtoType *P : Group)
-+      llvm::errs() << ' ' << (const void *)P;
++      if (P->isCanonicalUnqualified())
++        llvm::errs() << ' ' << (const void *)P;
 +    llvm::errs() << '\n';
 +  }
 +}
@@ -131,15 +282,69 @@ index 2228811..7f900db 100644
  QualType ASTContext::getFunctionTypeInternal(
      QualType ResultTy, ArrayRef<QualType> ArgArray,
      const FunctionProtoType::ExtProtoInfo &EPI, bool OnlyWantCanonical) const {
-@@ -5193,6 +5269,11 @@ QualType ASTContext::getFunctionTypeInternal(
+@@ -5056,16 +5271,28 @@ QualType ASTContext::getFunctionTypeInternal(
+ 
+   // Unique functions, to guarantee there is only one function of a particular
+   // structure.
++  // DIAGNOSTIC (not for upstream): depth tracking, and bracket the profile so
++  // we can tell whether this key was computed over an unwritten ICS argument
++  // array.
++  FPTCensusFrame FPTCensusThisFrame;
++  unsigned long FPTCensusReadsBefore = clang::ClangICSUnpopulatedReadCount;
++
+   llvm::FoldingSetNodeID ID;
+   FunctionProtoType::Profile(ID, ResultTy, ArgArray.begin(), NumArgs, EPI,
+                              *this, true);
++  bool FPTCensusProvisional =
++      clang::ClangICSUnpopulatedReadCount != FPTCensusReadsBefore;
+ 
+   QualType Canonical;
+   bool Unique = false;
+ 
+   void *InsertPos = nullptr;
+-  if (FunctionProtoType *FPT =
+-        FunctionProtoTypes.FindNodeOrInsertPos(ID, InsertPos)) {
++  FunctionProtoType *FPTCensusFound =
++      FunctionProtoTypes.FindNodeOrInsertPos(ID, InsertPos);
++  if (fptCensusEnabled() && isComputedNoexcept(EPI.ExceptionSpec.Type))
++    fptCensusLookup(*this, FPTCensusFound, FPTCensusProvisional,
++                    OnlyWantCanonical, ResultTy, ArgArray, EPI);
++  if (FunctionProtoType *FPT = FPTCensusFound) {
+     QualType Existing = QualType(FPT, 0);
+ 
+     // If we find a pre-existing equivalent FunctionProtoType, we can just reuse
+@@ -5193,6 +5420,10 @@ QualType ASTContext::getFunctionTypeInternal(
      FunctionProtoTypes.InsertNode(FTP, InsertPos);
    if (!EPI.FunctionEffects.empty())
      AnyFunctionEffects = true;
-+  // Canonical.isNull() here means the type we just built is its own canonical
-+  // type, which is the level at which two derivations of one function type are
-+  // required to converge on a single object.
-+  if (Canonical.isNull() && isComputedNoexcept(EPI.ExceptionSpec.Type))
-+    censusCanonicalComputedNoexceptType(FTP, ResultTy, ArgArray, EPI);
++  if (fptCensusEnabled() && isComputedNoexcept(EPI.ExceptionSpec.Type))
++    fptCensusBuilt(*this, FTP, FPTCensusProvisional, isCanonical,
++                   Canonical.isNull(), OnlyWantCanonical, ResultTy, ArgArray,
++                   EPI);
    return QualType(FTP, 0);
  }
  
+diff --git a/lib/AST/DeclTemplate.cpp b/lib/AST/DeclTemplate.cpp
+index 290c582..612c931 100644
+--- a/lib/AST/DeclTemplate.cpp
++++ b/lib/AST/DeclTemplate.cpp
+@@ -1184,7 +1184,19 @@ ICSWindowProbe &icsWindowProbe() {
+ }
+ } // namespace
+ 
++namespace clang {
++// DIAGNOSTIC (not for upstream): read by the CLANG_FPT_CENSUS instrumentation
++// in ASTContext.cpp, which brackets FunctionProtoType::Profile with it to tell
++// whether a FoldingSetNodeID was computed over an
++// ImplicitConceptSpecializationDecl whose trailing arguments had not been
++// written yet. Bumped unconditionally so CLANG_FPT_CENSUS works whether or not
++// CLANG_ICS_WINDOW is also enabled.
++unsigned long ClangICSUnpopulatedReadCount = 0;
++} // namespace clang
++
+ void ImplicitConceptSpecializationDecl::noteUnpopulatedRead() const {
++  ++clang::ClangICSUnpopulatedReadCount;
++
+   ICSWindowProbe &P = icsWindowProbe();
+   if (!P.Enabled)
+     return;
