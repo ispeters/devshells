@@ -154,6 +154,7 @@ final: prev: {
               ./patches/0005-diag-probe-ics-in-window-reads.patch
               ./patches/0006-diag-classify-ics-in-window-bytes.patch
               ./patches/0007-diag-name-ics-concept.patch
+              ./patches/0008-fpt-census.patch
             ];
           });
         }

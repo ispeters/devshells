@@ -1,0 +1,145 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ian Petersen <ispeters@gmail.com>
+Date: Sun, 6 Sep 2026 17:56:47 +0000
+Subject: [PATCH] [DIAGNOSTIC 0008] Census canonical computed-noexcept
+ FunctionProtoTypes
+
+Not for upstream. Instrumentation for llvm/llvm-project#191361.
+
+Records every canonical FunctionProtoType with a computed noexcept
+specification created in this process, grouped by a shallow key that covers
+result type, parameter types, exception-spec kind and variadicness, but
+deliberately excludes the deep profile of the noexcept expression itself.
+
+Canonical types are the level at which two derivations of one function type
+must converge on a single object, and for EST_DependentNoexcept the deep
+Expr profile is the only thing that can make them converge -- the noexcept
+Expr pointers differ when one derivation comes from a BMI and the other from
+Sema. So two entries in one group is exactly the mis-uniquing that a profile
+computed over an unwritten ImplicitConceptSpecializationDecl argument array
+would produce.
+
+Prints one [fpt] line per canonical computed-noexcept type created, so that a
+run with no duplicates can be distinguished from a run in which the situation
+never arose, and one [fpt-dup] line when a group grows past one.
+
+Gated on CLANG_FPT_CENSUS; CLANG_FPT_CENSUS_NAMES additionally prints the
+named concept of the noexcept expression, which dereferences a ConceptDecl and
+is therefore off by default.
+---
+ clang/lib/AST/ASTContext.cpp | 81 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 81 insertions(+)
+
+diff --git a/clang/lib/AST/ASTContext.cpp b/clang/lib/AST/ASTContext.cpp
+index 2228811..7f900db 100644
+--- a/clang/lib/AST/ASTContext.cpp
++++ b/clang/lib/AST/ASTContext.cpp
+@@ -33,6 +33,7 @@
+ #include "clang/AST/DependenceFlags.h"
+ #include "clang/AST/Expr.h"
+ #include "clang/AST/ExprCXX.h"
++#include "clang/AST/ExprConcepts.h"
+ #include "clang/AST/ExternalASTSource.h"
+ #include "clang/AST/Mangle.h"
+ #include "clang/AST/MangleNumberingContext.h"
+@@ -72,6 +73,7 @@
+ #include "llvm/ADT/APSInt.h"
+ #include "llvm/ADT/ArrayRef.h"
+ #include "llvm/ADT/DenseMap.h"
++#include "llvm/ADT/StringMap.h"
+ #include "llvm/ADT/DenseSet.h"
+ #include "llvm/ADT/FoldingSet.h"
+ #include "llvm/ADT/PointerUnion.h"
+@@ -5049,6 +5051,80 @@ static bool isCanonicalExceptionSpecification(
+   return false;
+ }
+ 
++//===----------------------------------------------------------------------===//
++// CLANG_FPT_CENSUS: temporary instrumentation for llvm/llvm-project#191361.
++//
++// Records every *canonical* FunctionProtoType with a computed noexcept
++// specification that this process creates, keyed on everything about the type
++// except the noexcept expression itself. Two canonical types landing in the
++// same group means the deep Expr profile failed to unique them: the two
++// derivations of one type were filed under different FoldingSet keys.
++//
++// Inert unless CLANG_FPT_CENSUS is set in the environment.
++//===----------------------------------------------------------------------===//
++namespace {
++struct FPTCensusState {
++  bool Enabled;
++  bool Names;
++  unsigned NumCanonical = 0;
++  llvm::StringMap<llvm::SmallVector<const FunctionProtoType *, 2>> Groups;
++
++  FPTCensusState()
++      : Enabled(::getenv("CLANG_FPT_CENSUS") != nullptr),
++        Names(::getenv("CLANG_FPT_CENSUS_NAMES") != nullptr) {}
++};
++} // namespace
++
++static FPTCensusState &getFPTCensusState() {
++  static FPTCensusState S;
++  return S;
++}
++
++static void censusCanonicalComputedNoexceptType(
++    const FunctionProtoType *FTP, QualType ResultTy, ArrayRef<QualType> ArgArray,
++    const FunctionProtoType::ExtProtoInfo &EPI) {
++  FPTCensusState &S = getFPTCensusState();
++  if (!S.Enabled)
++    return;
++
++  // Shallow key: identical to FunctionProtoType::Profile's contribution for
++  // everything that is compared by pointer, minus the deep profile of the
++  // noexcept expression. These are canonical types, so the parameter and
++  // result type pointers are directly comparable between derivations.
++  std::string Key;
++  {
++    llvm::raw_string_ostream OS(Key);
++    OS << ResultTy.getAsOpaquePtr();
++    for (QualType A : ArgArray)
++      OS << ',' << A.getAsOpaquePtr();
++    OS << '/' << unsigned(EPI.ExceptionSpec.Type) << '/' << EPI.Variadic;
++  }
++
++  auto &Group = S.Groups[Key];
++  Group.push_back(FTP);
++  ++S.NumCanonical;
++
++  llvm::errs() << "[fpt] canonical computed-noexcept type #" << S.NumCanonical
++               << " ptr=" << (const void *)FTP << " nparams=" << ArgArray.size()
++               << " est=" << unsigned(EPI.ExceptionSpec.Type)
++               << " noexcept-expr=" << (const void *)EPI.ExceptionSpec.NoexceptExpr
++               << " group-size=" << Group.size();
++  if (S.Names) {
++    if (const auto *CSE = dyn_cast_or_null<ConceptSpecializationExpr>(
++            EPI.ExceptionSpec.NoexceptExpr))
++      llvm::errs() << " concept=" << CSE->getNamedConcept()->getName();
++  }
++  llvm::errs() << '\n';
++
++  if (Group.size() > 1) {
++    llvm::errs() << "[fpt-dup] " << Group.size()
++                 << " canonical types share one shallow key:";
++    for (const FunctionProtoType *P : Group)
++      llvm::errs() << ' ' << (const void *)P;
++    llvm::errs() << '\n';
++  }
++}
++
+ QualType ASTContext::getFunctionTypeInternal(
+     QualType ResultTy, ArrayRef<QualType> ArgArray,
+     const FunctionProtoType::ExtProtoInfo &EPI, bool OnlyWantCanonical) const {
+@@ -5193,6 +5269,11 @@ QualType ASTContext::getFunctionTypeInternal(
+     FunctionProtoTypes.InsertNode(FTP, InsertPos);
+   if (!EPI.FunctionEffects.empty())
+     AnyFunctionEffects = true;
++  // Canonical.isNull() here means the type we just built is its own canonical
++  // type, which is the level at which two derivations of one function type are
++  // required to converge on a single object.
++  if (Canonical.isNull() && isComputedNoexcept(EPI.ExceptionSpec.Type))
++    censusCanonicalComputedNoexceptType(FTP, ResultTy, ArgArray, EPI);
+   return QualType(FTP, 0);
+ }
+ 
