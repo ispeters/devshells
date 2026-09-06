@@ -1,0 +1,205 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ian Petersen <ispeters@gmail.com>
+Date: Fri, 4 Sep 2026 12:00:00 -0700
+Subject: [PATCH] diag: probe reads of an ImplicitConceptSpecializationDecl's
+ unwritten trailing arguments
+
+Not for upstream.  Instrumentation only.
+
+`ImplicitConceptSpecializationDecl::CreateDeserialized` publishes
+`NumTemplateArgs` over raw ASTContext bump-allocator storage;
+`ASTDeclReader::VisitImplicitConceptSpecializationDecl` writes that
+storage only at the end, via `setTemplateArguments()`.  Between those two
+points `getTemplateArguments()` hands out an ArrayRef over uninitialized
+memory with no guard, and re-entrant deserialization can reach the decl
+and walk it.  Call that interval the window.
+
+Every measurement so far has used the crash as its signal, which is the
+window entry ANDed with two lotteries: whether the slab backing this
+decl was recycled rather than freshly mapped, and whether the recycled
+bytes are fatal rather than merely wrong.  This patch measures the window
+entry directly instead, so a run that does not crash still reports.
+
+It answers four open questions in one run:
+
+  - how many in-window reads happen per compile, and for how many
+    distinct decls (once per TU and hundreds per TU are both consistent
+    with the observed ~31% crash rate);
+  - which caller reaches the half-built decl, from the dumped stack --
+    currently inferred from a backtrace rather than observed;
+  - whether that caller's result feeds back into the argument being
+    deserialized, i.e. whether the dependency is genuinely circular;
+  - whether CLANG_CONSTRAINT_CACHE_RESERVE suppresses the crash by
+    changing whether the window is entered at all.  The census patch
+    (0004) ruled out the "no rehash means zeroed slab" explanation, and
+    nothing iterates UnsubstitutedConstraintSatisfactionCache, so no
+    mechanism currently connects that knob to this bug.  Comparing
+    in-window-reads at stock against reserve(3072) tests the only other
+    place the effect can live.
+
+The flag is packed into the spare bits of the existing `NumTemplateArgs`
+member, so `sizeof`, the allocation size and the offset of the trailing
+array are all unchanged; unlike the ASan, MallocScribble and cache-reserve
+arms, this does not perturb heap layout.  Instruction sequences do change
+marginally, which is the one residual difference from stock.
+
+Knobs:
+
+  CLANG_ICS_WINDOW=1          enable; summary line at exit
+  CLANG_ICS_WINDOW_STACKS=N   stacks for the first N distinct decls (dflt 3)
+  CLANG_ICS_WINDOW_LINES=N    cap on per-read lines (dflt 50)
+
+The summary prints whenever the probe is enabled, so `in-window-reads=0`
+is distinguishable from the knob failing to fire.
+
+The four llvm/std headers this needs are included at namespace scope next
+to the code that uses them, rather than in the file's include block, so
+that this patch does not conflict with 0003 and 0004, which edit that
+block.  Ugly, deliberate, and irrelevant to a patch that never lands.
+
+NOTE: paths in this diff are relative to the `clang/` subdirectory of the
+llvm-project monorepo, to match this repo's clang derivation's sourceRoot
+(clang-src-.../clang).
+---
+--- a/include/clang/AST/DeclTemplate.h
++++ b/include/clang/AST/DeclTemplate.h
+@@ -3237,12 +3237,22 @@
+     : public Decl,
+       private llvm::TrailingObjects<ImplicitConceptSpecializationDecl,
+                                     TemplateArgument> {
+-  unsigned NumTemplateArgs;
++  unsigned NumTemplateArgs : 31;
++
++  /// DIAGNOSTIC (not for upstream): 0 between CreateDeserialized(), which
++  /// publishes NumTemplateArgs over raw storage, and setTemplateArguments(),
++  /// which writes that storage.  Packed into the existing unsigned so that
++  /// sizeof(*this), the allocation size and the offset of the trailing array
++  /// are all unchanged by this patch.
++  unsigned ArgsPopulated : 1;
+ 
+   ImplicitConceptSpecializationDecl(DeclContext *DC, SourceLocation SL,
+                                     ArrayRef<TemplateArgument> ConvertedArgs);
+   ImplicitConceptSpecializationDecl(EmptyShell Empty, unsigned NumTemplateArgs);
+ 
++  /// DIAGNOSTIC (not for upstream): out of line to keep this header clean.
++  void noteUnpopulatedRead() const;
++
+ public:
+   static ImplicitConceptSpecializationDecl *
+   Create(const ASTContext &C, DeclContext *DC, SourceLocation SL,
+@@ -3252,6 +3262,10 @@
+                      unsigned NumTemplateArgs);
+ 
+   ArrayRef<TemplateArgument> getTemplateArguments() const {
++    // DIAGNOSTIC (not for upstream): catch reads that land in the window
++    // between CreateDeserialized() and setTemplateArguments().
++    if (!ArgsPopulated)
++      noteUnpopulatedRead();
+     return getTrailingObjects(NumTemplateArgs);
+   }
+   void setTemplateArguments(ArrayRef<TemplateArgument> Converted);
+--- a/lib/AST/DeclTemplate.cpp
++++ b/lib/AST/DeclTemplate.cpp
+@@ -1126,18 +1126,89 @@
+ //===----------------------------------------------------------------------===//
+ // ImplicitConceptSpecializationDecl Implementation
+ //===----------------------------------------------------------------------===//
++
++// DIAGNOSTIC (not for upstream).  Counts calls to getTemplateArguments() that
++// happen while the trailing TemplateArgument array is still raw storage, and
++// dumps a stack for the first few so the caller can be identified.
++//
++//   CLANG_ICS_WINDOW=1          enable; prints a summary line at exit
++//   CLANG_ICS_WINDOW_STACKS=N   stacks for the first N distinct decls (dflt 3)
++//   CLANG_ICS_WINDOW_LINES=N    cap on per-read lines (dflt 50)
++//
++// A summary line is printed whenever the probe is enabled, so a count of zero
++// is distinguishable from the knob failing to fire.
++//
++// These includes are deliberately here rather than at the top of the file: the
++// include block is already edited by the other diagnostic patches in this
++// series, and this patch should not have to care in what order they applied.
++#include "llvm/ADT/SmallPtrSet.h"
++#include "llvm/Support/Signals.h"
++#include "llvm/Support/raw_ostream.h"
++#include <cstdlib>
++
++namespace {
++struct ICSWindowProbe {
++  bool Enabled = false;
++  unsigned StackBudget = 3;
++  unsigned LineBudget = 50;
++  unsigned long Reads = 0;
++  llvm::SmallPtrSet<const void *, 16> Decls;
++
++  ICSWindowProbe() {
++    const char *E = std::getenv("CLANG_ICS_WINDOW");
++    Enabled = E && E[0] == '1';
++    if (const char *S = std::getenv("CLANG_ICS_WINDOW_STACKS"))
++      StackBudget = (unsigned)std::strtoul(S, nullptr, 10);
++    if (const char *S = std::getenv("CLANG_ICS_WINDOW_LINES"))
++      LineBudget = (unsigned)std::strtoul(S, nullptr, 10);
++  }
++
++  ~ICSWindowProbe() {
++    if (Enabled)
++      llvm::errs() << "[ics-window] in-window-reads=" << Reads
++                   << " distinct-decls=" << Decls.size() << "\n";
++  }
++};
++
++ICSWindowProbe &icsWindowProbe() {
++  static ICSWindowProbe P;
++  return P;
++}
++} // namespace
++
++void ImplicitConceptSpecializationDecl::noteUnpopulatedRead() const {
++  ICSWindowProbe &P = icsWindowProbe();
++  if (!P.Enabled)
++    return;
++
++  ++P.Reads;
++  bool First = P.Decls.insert(this).second;
++
++  if (P.LineBudget) {
++    --P.LineBudget;
++    llvm::errs() << "[ics-window] read decl=" << (const void *)this
++                 << " nargs=" << NumTemplateArgs << (First ? " first" : "")
++                 << "\n";
++  }
++
++  if (First && P.StackBudget) {
++    --P.StackBudget;
++    llvm::sys::PrintStackTrace(llvm::errs());
++  }
++}
++
+ ImplicitConceptSpecializationDecl::ImplicitConceptSpecializationDecl(
+     DeclContext *DC, SourceLocation SL,
+     ArrayRef<TemplateArgument> ConvertedArgs)
+     : Decl(ImplicitConceptSpecialization, DC, SL),
+-      NumTemplateArgs(ConvertedArgs.size()) {
++      NumTemplateArgs(ConvertedArgs.size()), ArgsPopulated(0) {
+   setTemplateArguments(ConvertedArgs);
+ }
+ 
+ ImplicitConceptSpecializationDecl::ImplicitConceptSpecializationDecl(
+     EmptyShell Empty, unsigned NumTemplateArgs)
+     : Decl(ImplicitConceptSpecialization, Empty),
+-      NumTemplateArgs(NumTemplateArgs) {}
++      NumTemplateArgs(NumTemplateArgs), ArgsPopulated(0) {}
+ 
+ ImplicitConceptSpecializationDecl *ImplicitConceptSpecializationDecl::Create(
+     const ASTContext &C, DeclContext *DC, SourceLocation SL,
+@@ -1158,6 +1229,8 @@
+     ArrayRef<TemplateArgument> Converted) {
+   assert(Converted.size() == NumTemplateArgs);
+   llvm::uninitialized_copy(Converted, getTrailingObjects());
++  // DIAGNOSTIC (not for upstream): the window closes here.
++  ArgsPopulated = 1;
+ }
+ 
+ //===----------------------------------------------------------------------===//
+-- 
+2.43.0

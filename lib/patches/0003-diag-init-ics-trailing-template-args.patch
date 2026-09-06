@@ -1,0 +1,102 @@
+From: Ian Petersen <ispeters@gmail.com>
+Subject: [PATCH] DIAGNOSTIC: env-gated value-init of ImplicitConceptSpecializationDecl trailing args
+
+NOT FOR UPSTREAM. Mechanism knockout for the nondeterministic crash
+tracked at llvm/llvm-project#191361.
+
+ImplicitConceptSpecializationDecl::CreateDeserialized sets
+NumTemplateArgs immediately but leaves the trailing TemplateArgument
+array as raw ASTContext bump-allocator storage. The array is written
+only at the end of
+ASTDeclReader::VisitImplicitConceptSpecializationDecl, by
+setTemplateArguments(), after every argument has been read. Because
+deserialization is re-entrant, a nested read can reach the decl in that
+window via a ConceptSpecializationExpr; StmtProfiler then walks
+getTemplateArguments() and dereferences whatever is in the slab.
+
+Value-initializing under the env var turns those wild reads into Null
+TemplateArguments. That is NOT a fix -- it trades a crash for a
+silently incorrect FoldingSetNodeID, and therefore for potential
+mis-uniquing of the FunctionProtoType being deserialized -- but it is a
+clean single-variable test: the allocation size and address are
+unchanged, so this arm perturbs no heap layout, unlike the constraint
+cache reserve, MallocScribble and ASan arms.
+
+Arms:
+  unset                          -> stock behaviour (control)
+  CLANG_ICS_INIT_TRAILING_ARGS=1 -> value-initialize the trailing array
+
+A one-shot "[ics-init]" line on stderr proves the arm fired rather than
+silently no-opping. It prints at most once per process, and stderr is
+discarded by the rate-counting loops, so rates are unaffected.
+
+NOTE: paths in this diff are relative to the `clang/` subdirectory of
+the llvm-project monorepo, to match this repo's clang derivation's
+sourceRoot (clang-src-.../clang).
+---
+diff --git a/lib/AST/DeclTemplate.cpp b/lib/AST/DeclTemplate.cpp
+index 3ff6e3a..8744c85 100644
+--- a/lib/AST/DeclTemplate.cpp
++++ b/lib/AST/DeclTemplate.cpp
+@@ -32,7 +32,10 @@
+ #include "llvm/ADT/STLExtras.h"
+ #include "llvm/ADT/SmallVector.h"
+ #include "llvm/Support/ErrorHandling.h"
++#include "llvm/Support/raw_ostream.h"
+ #include <cassert>
++#include <cstdlib>
++#include <memory>
+ #include <optional>
+ #include <utility>
+ 
+@@ -1150,8 +1153,46 @@ ImplicitConceptSpecializationDecl *ImplicitConceptSpecializationDecl::Create(
+ ImplicitConceptSpecializationDecl *
+ ImplicitConceptSpecializationDecl::CreateDeserialized(
+     const ASTContext &C, GlobalDeclID ID, unsigned NumTemplateArgs) {
+-  return new (C, ID, additionalSizeToAlloc<TemplateArgument>(NumTemplateArgs))
+-      ImplicitConceptSpecializationDecl(EmptyShell{}, NumTemplateArgs);
++  auto *Result =
++      new (C, ID, additionalSizeToAlloc<TemplateArgument>(NumTemplateArgs))
++          ImplicitConceptSpecializationDecl(EmptyShell{}, NumTemplateArgs);
++
++  // DIAGNOSTIC HOOK (downstream patch, not for upstream).
++  //
++  // The trailing TemplateArgument array is left as raw storage here; it is
++  // only written later, by ASTDeclReader::VisitImplicitConceptSpecializationDecl
++  // calling setTemplateArguments() *after* it has finished reading every
++  // argument. NumTemplateArgs, however, is set right now. Between the two
++  // points the decl claims to have N arguments while the array holds whatever
++  // the ASTContext bump slab happened to contain, and deserialization is
++  // re-entrant: a nested read can reach this decl through a
++  // ConceptSpecializationExpr and hand the array to StmtProfiler, which reads
++  // every element's kind and then its payload.
++  //
++  // Value-initializing here does not fix that -- it converts a wild read into
++  // a Null TemplateArgument, i.e. a crash into a silently wrong
++  // FoldingSetNodeID -- but it is a mechanism-specific knockout: the
++  // allocation size and address are unchanged, so unlike every previous
++  // suppressor this one perturbs no heap layout at all.
++  //
++  //   unset                          -> stock behaviour (control)
++  //   CLANG_ICS_INIT_TRAILING_ARGS=1 -> value-initialize the trailing array
++  //
++  // The one-shot stderr note exists so the arm cannot silently no-op; it
++  // fires at most once per process and goes to stderr, so rate-counting
++  // loops that discard stderr are unaffected.
++  if (std::getenv("CLANG_ICS_INIT_TRAILING_ARGS")) {
++    std::uninitialized_value_construct_n(Result->getTrailingObjects(),
++                                         NumTemplateArgs);
++    static bool Reported = false;
++    if (!Reported) {
++      Reported = true;
++      llvm::errs() << "[ics-init] value-initializing trailing "
++                      "TemplateArgument arrays\n";
++    }
++  }
++
++  return Result;
+ }
+ 
+ void ImplicitConceptSpecializationDecl::setTemplateArguments(
+-- 
+2.43.0

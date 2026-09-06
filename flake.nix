@@ -13,7 +13,10 @@
       system = "aarch64-darwin";
       pkgs = import nixpkgs {
         inherit system;
-        overlays = [ (import ./lib/llvm23-overlay.nix) ];
+        overlays = [
+          (import ./lib/llvm23-overlay.nix)
+          (import ./lib/llvm-trunk-overlay.nix)
+        ];
       };
       shellFiles = builtins.readDir ./shells;
       names = map (n: nixpkgs.lib.removeSuffix ".nix" n) (

@@ -1,0 +1,51 @@
+From: Ian Petersen <ispeters@gmail.com>
+Subject: [PATCH] Serialization: don't call getAPValue() on a value-dependent TypeTraitExpr
+
+TypeTraitExpr::getAPValue() asserts !isValueDependent(), but
+ASTStmtWriter::VisitTypeTraitExpr() calls it unconditionally for any
+non-boolean type trait, including value-dependent ones (e.g. a
+dependent use of __builtin_structured_binding_size). In an
+assertions-enabled build this aborts while writing a BMI; in a
+release build it happens to be well-defined only because
+TypeTraitExpr::Create(..., APValue) always allocates the trailing
+APValue slot, so an empty APValue is read back -- but that's
+incidental, not intentional.
+
+Port the guard already present on `main` (as of the IsComparisonResult
+work) back onto the 23.1.0 writer: write an empty APValue for the
+value-dependent case instead of dereferencing the (absent) stored one.
+
+Local repro:
+
+    export module repro;
+    export template <class T>
+      requires(__builtin_structured_binding_size(T) >= 0U)
+    inline constexpr int v = __builtin_structured_binding_size(T);
+
+    clang++ -std=c++23 --precompile repro.cppm -o repro.pcm
+
+aborts on an assertions build of 23.1.0 without this patch.
+
+NOTE: paths in this diff are relative to the `clang/` subdirectory of
+the llvm-project monorepo (i.e. no leading `clang/` component), to
+match this repo's clang derivation's sourceRoot (clang-src-.../clang)
+and its other patches (e.g. purity.patch's "lib/Driver/...").
+---
+ lib/Serialization/ASTWriterStmt.cpp | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/lib/Serialization/ASTWriterStmt.cpp b/lib/Serialization/ASTWriterStmt.cpp
+index 1111111..2222222 100644
+--- a/lib/Serialization/ASTWriterStmt.cpp
++++ b/lib/Serialization/ASTWriterStmt.cpp
+@@ -2250,6 +2250,8 @@ void ASTStmtWriter::VisitTypeTraitExpr(TypeTraitExpr *E) {
+ 
+   if (E->TypeTraitExprBits.IsBooleanTypeTrait)
+     Record.push_back(E->TypeTraitExprBits.Value);
++  else if (E->isValueDependent())
++    Record.AddAPValue(APValue());
+   else
+     Record.AddAPValue(E->getAPValue());
+ 
+-- 
+2.43.0

@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ian Petersen <ispeters@gmail.com>
+Date: Fri, 5 Sep 2026 12:00:00 -0700
+Subject: [PATCH] diag: name the concept whose args are read in the window
+
+Not for upstream.  Instrumentation only.  Applies on top of 0005 (needs
+the ArgsPopulated bit); independent of 0006.
+
+ImplicitConceptSpecializationDecl holds only NumTemplateArgs and its
+trailing array -- it has no pointer back to the ConceptDecl it specializes
+-- so noteUnpopulatedRead() cannot name the concept.  The
+ConceptSpecializationExpr can: it owns both the ConceptReference and the
+SpecDecl.  Report from there instead, on exactly the event the ics-window
+probe counts.  The decl pointer is printed so the two can be correlated.
+
+  CLANG_ICS_WINDOW_NAMES=1 -> one "[ics-name] concept=... decl=..." line per
+                              in-window read
+
+No source location: StmtProfiler's base class carries only the
+FoldingSetNodeID and two flags, with no ASTContext or SourceManager to
+print one against, and plumbing one in is not worth it for a throwaway
+patch.  The concept name is enough to find the declaration by hand.
+
+The point is to identify which of stdexec's concepts are involved without
+reducing the module interface, which needs two compiles per cvise test and
+a preprocessed .cppm that may not round-trip.
+
+Adds a public hasPopulatedArgs() accessor, since StmtProfiler is not a
+friend of the decl.
+
+NOTE: paths in this diff are relative to the `clang/` subdirectory of the
+llvm-project monorepo, to match this repo's clang derivation's sourceRoot
+(clang-src-.../clang).
+---
+--- a/include/clang/AST/DeclTemplate.h
++++ b/include/clang/AST/DeclTemplate.h
+@@ -3270,6 +3270,10 @@
+   }
+   void setTemplateArguments(ArrayRef<TemplateArgument> Converted);
+ 
++  /// DIAGNOSTIC (not for upstream): false between CreateDeserialized() and
++  /// setTemplateArguments().  Public so StmtProfiler can name the concept.
++  bool hasPopulatedArgs() const { return ArgsPopulated; }
++
+   static bool classofKind(Kind K) { return K == ImplicitConceptSpecialization; }
+   static bool classof(const Decl *D) { return classofKind(D->getKind()); }
+ 
+--- a/lib/AST/StmtProfile.cpp
++++ b/lib/AST/StmtProfile.cpp
+@@ -22,6 +22,8 @@
+ #include "clang/AST/OpenMPClause.h"
+ #include "clang/AST/StmtVisitor.h"
+ #include "llvm/ADT/FoldingSet.h"
++#include "llvm/Support/raw_ostream.h"
++#include <cstdlib>
+ using namespace clang;
+ 
+ namespace {
+@@ -1764,6 +1766,22 @@
+                                            const ConceptSpecializationExpr *S) {
+   VisitExpr(S);
+   VisitDecl(S->getNamedConcept());
++
++  // DIAGNOSTIC (not for upstream).  The ImplicitConceptSpecializationDecl has
++  // no back-pointer to its concept, so the name has to be reported from here,
++  // where the ConceptSpecializationExpr is in hand.  Fires on exactly the same
++  // event the ics-window probe counts; the decl pointer correlates the two.
++  //
++  // StmtProfiler carries no ASTContext or SourceManager, so no source location
++  // is printed -- the concept's name is enough to locate it by hand.
++  if (!S->getSpecializationDecl()->hasPopulatedArgs() &&
++      std::getenv("CLANG_ICS_WINDOW_NAMES")) {
++    const auto *D = S->getSpecializationDecl();
++    llvm::errs() << "[ics-name] concept=" << S->getNamedConcept()->getName()
++                 << " decl=" << (const void *)D
++                 << " nargs=" << D->getTemplateArguments().size() << "\n";
++  }
++
+   for (const TemplateArgument &Arg : S->getTemplateArguments())
+     VisitTemplateArgument(Arg);
+ }
+-- 
+2.43.0
