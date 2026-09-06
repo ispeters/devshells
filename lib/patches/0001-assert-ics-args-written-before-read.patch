@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ian Petersen <ispeters@gmail.com>
+Date: Fri, 5 Sep 2026 12:00:00 -0700
+Subject: [PATCH] Assert that an ImplicitConceptSpecializationDecl's template
+ arguments have been written before they are read
+
+Diagnostic patch for llvm/llvm-project#191361.  Not proposed for merge as
+is; it exists so the defect can be observed without waiting for the
+nondeterministic crash.
+
+`ImplicitConceptSpecializationDecl::CreateDeserialized` allocates the decl
+with room for NumTemplateArgs trailing TemplateArguments and runs an
+EmptyShell constructor that sets only the count -- the trailing objects are
+never constructed.  `ASTDeclReader::VisitImplicitConceptSpecializationDecl`
+writes them at the end, via setTemplateArguments(), after reading each
+argument from the stream.  In between, `getTemplateArguments()` hands out an
+ArrayRef over uninitialized memory with no guard, and re-entrant
+deserialization can reach the decl through the loaded-decls map and walk it:
+
+  StmtProfiler::VisitConceptSpecializationExpr
+  Stmt::Profile
+  FunctionProtoType::Profile
+  ASTContext::getFunctionTypeInternal          <- uniquing a function type
+  AbstractTypeReader::readFunctionProtoType
+  ASTReader::readTypeRecord / GetType
+  ASTDeclReader::VisitFunctionDecl
+  ASTReader::ReadDeclRecord / GetDecl
+  AbstractTypeReader::readSubstTemplateTypeParmType
+  BasicReaderBase::readTemplateArgument
+  ASTDeclReader::VisitImplicitConceptSpecializationDecl   <- the push_back loop
+
+The flag is packed into the spare bits of the existing NumTemplateArgs
+member, so sizeof, the allocation size, and the offset of the trailing array
+are all unchanged; the assert fires on the read itself rather than on the
+downstream crash, which only happens when the recycled bytes in that storage
+happen to be fatal.
+
+NOTE: paths in this diff are relative to the `clang/` subdirectory of the
+llvm-project monorepo.
+---
+--- a/include/clang/AST/DeclTemplate.h
++++ b/include/clang/AST/DeclTemplate.h
+@@ -3237,7 +3237,14 @@
+     : public Decl,
+       private llvm::TrailingObjects<ImplicitConceptSpecializationDecl,
+                                     TemplateArgument> {
+-  unsigned NumTemplateArgs;
++  unsigned NumTemplateArgs : 31;
++
++  /// True once setTemplateArguments() has written the trailing array.  False
++  /// between CreateDeserialized(), which publishes NumTemplateArgs over raw
++  /// storage, and setTemplateArguments().  Packed into the spare bits of the
++  /// existing member so that sizeof, the allocation size, and the offset of
++  /// the trailing array are all unchanged.
++  unsigned ArgsPopulated : 1;
+ 
+   ImplicitConceptSpecializationDecl(DeclContext *DC, SourceLocation SL,
+                                     ArrayRef<TemplateArgument> ConvertedArgs);
+@@ -3252,6 +3259,9 @@
+                      unsigned NumTemplateArgs);
+ 
+   ArrayRef<TemplateArgument> getTemplateArguments() const {
++    assert(ArgsPopulated &&
++           "reading ImplicitConceptSpecializationDecl's template arguments "
++           "before setTemplateArguments() has written them");
+     return getTrailingObjects(NumTemplateArgs);
+   }
+   void setTemplateArguments(ArrayRef<TemplateArgument> Converted);
+--- a/lib/AST/DeclTemplate.cpp
++++ b/lib/AST/DeclTemplate.cpp
+@@ -1130,14 +1130,14 @@
+     DeclContext *DC, SourceLocation SL,
+     ArrayRef<TemplateArgument> ConvertedArgs)
+     : Decl(ImplicitConceptSpecialization, DC, SL),
+-      NumTemplateArgs(ConvertedArgs.size()) {
++      NumTemplateArgs(ConvertedArgs.size()), ArgsPopulated(0) {
+   setTemplateArguments(ConvertedArgs);
+ }
+ 
+ ImplicitConceptSpecializationDecl::ImplicitConceptSpecializationDecl(
+     EmptyShell Empty, unsigned NumTemplateArgs)
+     : Decl(ImplicitConceptSpecialization, Empty),
+-      NumTemplateArgs(NumTemplateArgs) {}
++      NumTemplateArgs(NumTemplateArgs), ArgsPopulated(0) {}
+ 
+ ImplicitConceptSpecializationDecl *ImplicitConceptSpecializationDecl::Create(
+     const ASTContext &C, DeclContext *DC, SourceLocation SL,
+@@ -1158,6 +1158,7 @@
+     ArrayRef<TemplateArgument> Converted) {
+   assert(Converted.size() == NumTemplateArgs);
+   llvm::uninitialized_copy(Converted, getTrailingObjects());
++  ArgsPopulated = 1;
+ }
+ 
+ //===----------------------------------------------------------------------===//
+-- 
+2.43.0

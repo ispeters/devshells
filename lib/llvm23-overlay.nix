@@ -152,6 +152,86 @@ final: prev: {
               ./patches/0003-diag-init-ics-trailing-template-args.patch
               ./patches/0004-diag-census-ics-trailing-storage.patch
               ./patches/0005-diag-probe-ics-in-window-reads.patch
+              ./patches/0006-diag-classify-ics-in-window-bytes.patch
+              ./patches/0007-diag-name-ics-concept.patch
+            ];
+          });
+        }
+      );
+
+  # An assertions-enabled build of Clang with just enough patches to observe
+  # the ICE I've been chasing
+  llvmPackages_23_assert_minimal =
+    (
+      (final.mkLLVMPackages {
+        name = "23_assert_minimal";
+        version = "23.1.0";
+        gitRelease = {
+          rev = "llvmorg-23.1.0";
+          rev-version = "23.1.0";
+          sha256 = "sha256-Astfi1UDDcydyws3Q1sELqho/PxiNN/tvCtmCGj5FoE=";
+        };
+      }).value
+    ).overrideScope
+      (
+        lFinal: lPrev:
+        let
+          # Assertions MUST be enabled uniformly across libllvm and libclang.
+          # HandleLLVMOptions.cmake sets LLVM_ENABLE_ABI_BREAKING_CHECKS=1
+          # when LLVM_ENABLE_ASSERTIONS is on and LLVM_ABI_BREAKING_CHECKS is
+          # WITH_ASSERTS (the default), and that flag changes data structure
+          # layouts. Mixing an asserts libclang against a no-asserts libLLVM
+          # is an ABI mismatch that manifests as its own crashes -- which
+          # would be indistinguishable from the bug under investigation.
+          withAssertions =
+            drv:
+            drv.overrideAttrs (old: {
+              cmakeFlags = (old.cmakeFlags or [ ]) ++ [ "-DLLVM_ENABLE_ASSERTIONS=ON" ];
+              # LLVM_ENABLE_ASSERTIONS also turns on standard-library
+              # hardening, adding -D_LIBCPP_HARDENING_MODE=..._EXTENSIVE.
+              # nixpkgs' cc-wrapper separately injects ..._FAST via its
+              # `libcxxhardeningfast` hardening flag, so both land on the
+              # command line with differing values and every TU warns
+              # -Wmacro-redefined. LLVM's -D comes later and wins, so the
+              # effective mode is EXTENSIVE either way -- but the warning is
+              # fatal wherever a subproject builds with -Werror. Drop the
+              # wrapper's flag so LLVM's intent stands unopposed.
+              #
+              # (The ASan scope avoids this collision only incidentally, via
+              # its broader hardeningDisable = [ "all" ].)
+              hardeningDisable = (old.hardeningDisable or [ ]) ++ [ "libcxxhardeningfast" ];
+              # LLVM's own test suite is not what we're here for, and
+              # assertions make it slower and noisier.
+              doCheck = false;
+            });
+        in
+        {
+          # LLVM_INCLUDE_BENCHMARKS=OFF is required here, not just tidy.
+          # LLVM_ENABLE_ASSERTIONS also switches on standard-library
+          # hardening (HandleLLVMOptions.cmake adds -D_GLIBCXX_ASSERTIONS and
+          # -D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE), which
+          # collides with the _LIBCPP_HARDENING_MODE=..._FAST that nixpkgs'
+          # cc-wrapper already injects. The resulting -Wmacro-redefined is
+          # merely a warning throughout LLVM proper, but third-party/benchmark
+          # builds with BENCHMARK_ENABLE_WERROR=ON (its default) and so turns
+          # it into a hard error. Dropping the benchmarks removes the only
+          # -Werror consumer of the redefinition; -DBENCHMARK_ENABLE_WERROR=OFF
+          # would also work, but we have no use for the benchmarks here.
+          libllvm = (withAssertions lPrev.libllvm).overrideAttrs (old: {
+            cmakeFlags = old.cmakeFlags ++ [ "-DLLVM_INCLUDE_BENCHMARKS=OFF" ];
+          });
+
+          # See the plain llvmPackages_23 scope for the underlying bug.
+          # Only needed here, not on release-mode clang-unwrapped above: in
+          # a no-assertions build, TypeTraitExpr::getAPValue() on a
+          # value-dependent trait is incidentally well-defined (the trailing
+          # APValue slot is always allocated and already holds the same
+          # empty APValue this patch writes explicitly), so there's nothing
+          # to fix there. It only aborts once LLVM_ENABLE_ASSERTIONS is on --
+          # exactly this scope.
+          libclang = (withAssertions lPrev.libclang).overrideAttrs (old: {
+            patches = (old.patches or [ ]) ++ [
+              ./patches/0001-assert-ics-args-written-before-read.patch
             ];
           });
         }

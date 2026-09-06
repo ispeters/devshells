@@ -1,0 +1,126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ian Petersen <ispeters@gmail.com>
+Date: Fri, 5 Sep 2026 12:00:00 -0700
+Subject: [PATCH] diag: classify the bytes of arrays actually read in the window
+
+Not for upstream.  Instrumentation only.  Applies on top of 0005.
+
+0005 established that this TU enters the window 16 times per compile, for
+16 distinct decls, all with NumTemplateArgs == 2, and that the caller is
+the same every time: getFunctionTypeInternal -> FunctionProtoType::Profile
+-> Stmt::Profile -> StmtProfiler::VisitConceptSpecializationExpr.
+
+A crash needs three things at once: the window is entered, the slab
+backing that decl holds recycled bytes rather than fresh zeroed pages,
+and those bytes are fatal rather than merely wrong.  The first conjunct
+is now measured and is identical (16) at stock,
+CLANG_CONSTRAINT_CACHE_RESERVE=3071 and =3072, so the reserve knob's
+suppression does not act there.  The census patch (0004) measured the
+second conjunct over the wrong population -- all 539 decls at creation,
+almost all of which are written promptly and never read in the window --
+and found ~45% garbage in both the crashing and non-crashing arms.
+
+This patch measures the second conjunct over the right population: the
+bytes of the trailing array at the moment it is read, for exactly those
+16 arrays.  Each read is classified zero / aa / 55 / mixed, the counts
+are reported in the exit summary, and the first bytes are dumped for
+mixed arrays.
+
+The prediction under the surviving hypothesis is that stock shows mixed
+arrays among the 16 and reserve(3072) shows zero.  If both arms look the
+same, the reserve effect is in none of the three conjuncts we have
+enumerated, and it should be reported upstream as an unexplained
+observation rather than explained away for a third time.
+
+Note the counters are tallied regardless of CLANG_ICS_WINDOW_LINES, so
+the rate arms can run with LINES=0 and STACKS=0 and still report.
+
+NOTE: paths in this diff are relative to the `clang/` subdirectory of the
+llvm-project monorepo, to match this repo's clang derivation's sourceRoot
+(clang-src-.../clang).
+---
+--- a/lib/AST/DeclTemplate.cpp
++++ b/lib/AST/DeclTemplate.cpp
+@@ -1145,6 +1145,7 @@
+ #include "llvm/Support/Signals.h"
+ #include "llvm/Support/raw_ostream.h"
+ #include <cstdlib>
++#include <cstring>
+ 
+ namespace {
+ struct ICSWindowProbe {
+@@ -1152,6 +1153,7 @@
+   unsigned StackBudget = 3;
+   unsigned LineBudget = 50;
+   unsigned long Reads = 0;
++  unsigned long Zero = 0, AA = 0, Fill55 = 0, Mixed = 0;
+   llvm::SmallPtrSet<const void *, 16> Decls;
+ 
+   ICSWindowProbe() {
+@@ -1166,7 +1168,9 @@
+   ~ICSWindowProbe() {
+     if (Enabled)
+       llvm::errs() << "[ics-window] in-window-reads=" << Reads
+-                   << " distinct-decls=" << Decls.size() << "\n";
++                   << " distinct-decls=" << Decls.size() << " zero=" << Zero
++                   << " aa=" << AA << " 55=" << Fill55 << " mixed=" << Mixed
++                   << "\n";
+   }
+ };
+ 
+@@ -1184,11 +1188,52 @@
+   ++P.Reads;
+   bool First = P.Decls.insert(this).second;
+ 
++  // Classify the bytes of *this* array -- the population that matters.  The
++  // census patch (0004) samples every decl at creation, which is dominated by
++  // arrays that are written promptly and never read in the window; only these
++  // reads can produce a crash, and only if the bytes happen to be fatal rather
++  // than merely wrong.  Byte-at-a-time memcpy for the same reason as 0004.
++  const auto *Bytes =
++      reinterpret_cast<const unsigned char *>(getTrailingObjects());
++  const size_t NumBytes = size_t(NumTemplateArgs) * sizeof(TemplateArgument);
++  bool AllZero = true, AllAA = true, All55 = true;
++  for (size_t I = 0; I != NumBytes; ++I) {
++    unsigned char B;
++    std::memcpy(&B, Bytes + I, 1);
++    AllZero &= (B == 0x00);
++    AllAA &= (B == 0xAA);
++    All55 &= (B == 0x55);
++  }
++  const char *Class = "mixed";
++  if (!NumBytes)
++    Class = "empty";
++  else if (AllZero) {
++    Class = "zero";
++    ++P.Zero;
++  } else if (AllAA) {
++    Class = "aa";
++    ++P.AA;
++  } else if (All55) {
++    Class = "55";
++    ++P.Fill55;
++  } else
++    ++P.Mixed;
++
+   if (P.LineBudget) {
+     --P.LineBudget;
+     llvm::errs() << "[ics-window] read decl=" << (const void *)this
+                  << " nargs=" << NumTemplateArgs << (First ? " first" : "")
+-                 << "\n";
++                 << " bytes=" << Class;
++    if (NumBytes && !AllZero && !AllAA && !All55) {
++      static const char Hex[] = "0123456789abcdef";
++      llvm::errs() << " raw=";
++      for (size_t I = 0; I != (NumBytes < 24 ? NumBytes : size_t(24)); ++I) {
++        unsigned char B;
++        std::memcpy(&B, Bytes + I, 1);
++        llvm::errs() << Hex[B >> 4] << Hex[B & 0xf];
++      }
++    }
++    llvm::errs() << "\n";
+   }
+ 
+   if (First && P.StackBudget) {
+-- 
+2.43.0
