@@ -1,4 +1,18 @@
 { pkgs, ... }:
+let
+  # A named profile whose VM outlives the shell. Stopping (rather than
+  # deleting) it on exit keeps its disk, so pulled images and anything else
+  # stored in the VM survive between sessions.
+  #
+  # The resources are sized for building Clang from source inside an amd64
+  # container under Rosetta. `colima start` applies explicitly passed
+  # --cpus/--memory to an existing stopped profile, so changing these takes
+  # effect on the next shell entry; disk can only grow. To reclaim the space:
+  #     colima delete --profile stdexec-repro
+  profile = "stdexec-repro";
+  cpus = 8;
+  memoryGiB = 16;
+in
 pkgs.mkShell {
   packages = with pkgs; [
     colima
@@ -6,7 +20,7 @@ pkgs.mkShell {
   ];
 
   shellHook = ''
-    LOCKFILE="''${TMPDIR:-/tmp}/colima-docker-devshell.lock"
+    LOCKFILE="''${TMPDIR:-/tmp}/colima-docker-devshell-${profile}.lock"
 
     if [[ -f "$LOCKFILE" ]]; then
       owner_pid=$(cat "$LOCKFILE")
@@ -30,11 +44,15 @@ pkgs.mkShell {
     fi
 
     echo $$ > "$LOCKFILE"
-    colima start --vm-type vz --vz-rosetta
+    colima start --profile ${profile} --vm-type vz --vz-rosetta \
+      --cpus ${toString cpus} --memory ${toString memoryGiB}
+
+    # colima switches the global docker context on start; pin this shell to
+    # the profile's context so it doesn't depend on that global state.
+    export DOCKER_CONTEXT=colima-${profile}
 
     cleanup() {
-      colima stop
-      colima delete -f
+      colima stop --profile ${profile}
       rm -f "$LOCKFILE"
     }
     trap cleanup EXIT
