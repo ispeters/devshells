@@ -9,6 +9,7 @@ let
     profile
     cpus
     memoryGiB
+    diskGiB
     dockerContext
     ;
 in
@@ -44,7 +45,8 @@ pkgs.mkShell {
 
     echo $$ > "$LOCKFILE"
     colima start --profile ${profile} --vm-type vz --vz-rosetta \
-      --cpus ${toString cpus} --memory ${toString memoryGiB}
+      --cpus ${toString cpus} --memory ${toString memoryGiB} \
+      --disk ${toString diskGiB}
 
     # colima switches the global docker context on start; pin this shell to
     # the profile's context so it doesn't depend on that global state.
