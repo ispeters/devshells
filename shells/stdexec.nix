@@ -42,5 +42,10 @@ mkClangDevShell {
     # Pin docker to the VM's context rather than whatever global context
     # colima last switched to, as shells/colima-docker.nix does.
     export DOCKER_CONTEXT=${dockerContext}
+
+    # Keep CPM's downloads (Catch2, and Boost or Taskflow when enabled) in one
+    # place shared by every build directory, instead of re-downloading them on
+    # each fresh configure.
+    export CPM_SOURCE_CACHE="''${CPM_SOURCE_CACHE:-$HOME/.cache/CPM}"
   '';
 }
