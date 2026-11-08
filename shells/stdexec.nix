@@ -2,6 +2,10 @@
 let
   mkClangDevShell = import ../lib/mk-clang-dev-shell.nix { inherit pkgs; };
   mkLlvmReleaseTool = import ../lib/mk-llvm-release-tool.nix { inherit pkgs; };
+  stdexec-ci = import ../lib/stdexec-ci { inherit pkgs; };
+  # The Colima VM that shells/colima-docker.nix starts and stops; this shell
+  # only talks to it.
+  inherit (import ../lib/colima-profile.nix) dockerContext;
 
   clang-format-21_1_5 = mkLlvmReleaseTool {
     tool = "clang-format";
@@ -25,12 +29,23 @@ mkClangDevShell {
   };
   extraPackages = with pkgs; [
     cmake
+    docker-client
     gersemi
     lldb
     ninja
     pythonEnv
+    stdexec-ci
   ];
   extraShellHook = ''
     export STDEXEC_LIBCLANG="${llvmPackages.libclang.lib}/lib/libclang.dylib"
+
+    # Pin docker to the VM's context rather than whatever global context
+    # colima last switched to, as shells/colima-docker.nix does.
+    export DOCKER_CONTEXT=${dockerContext}
+
+    # Keep CPM's downloads (Catch2, and Boost or Taskflow when enabled) in one
+    # place shared by every build directory, instead of re-downloading them on
+    # each fresh configure.
+    export CPM_SOURCE_CACHE="''${CPM_SOURCE_CACHE:-$HOME/.cache/CPM}"
   '';
 }
