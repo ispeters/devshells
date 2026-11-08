@@ -10,8 +10,8 @@
 #     colima delete --profile stdexec-repro
 rec {
   profile = "stdexec-repro";
-  cpus = 8;
-  memoryGiB = 16;
+  cpus = 10;
+  memoryGiB = 48;
   # Colima's default is 100 GiB, which the CI images alone nearly fill. The
   # disk image is sparse, so this only uses what's written.
   diskGiB = 200;
