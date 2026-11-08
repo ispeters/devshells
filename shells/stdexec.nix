@@ -3,6 +3,9 @@ let
   mkClangDevShell = import ../lib/mk-clang-dev-shell.nix { inherit pkgs; };
   mkLlvmReleaseTool = import ../lib/mk-llvm-release-tool.nix { inherit pkgs; };
   stdexec-ci = import ../lib/stdexec-ci { inherit pkgs; };
+  # The Colima VM that shells/colima-docker.nix starts and stops; this shell
+  # only talks to it.
+  inherit (import ../lib/colima-profile.nix) dockerContext;
 
   clang-format-21_1_5 = mkLlvmReleaseTool {
     tool = "clang-format";
@@ -26,6 +29,7 @@ mkClangDevShell {
   };
   extraPackages = with pkgs; [
     cmake
+    docker-client
     gersemi
     lldb
     ninja
@@ -34,5 +38,9 @@ mkClangDevShell {
   ];
   extraShellHook = ''
     export STDEXEC_LIBCLANG="${llvmPackages.libclang.lib}/lib/libclang.dylib"
+
+    # Pin docker to the VM's context rather than whatever global context
+    # colima last switched to, as shells/colima-docker.nix does.
+    export DOCKER_CONTEXT=${dockerContext}
   '';
 }
