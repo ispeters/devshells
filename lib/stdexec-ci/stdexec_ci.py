@@ -20,6 +20,9 @@ local substitutions:
   * ctest / valgrind       -> skipped unless --test is given
   * stack size limit       -> 32 MiB instead of Docker's 8 MiB (--stack-mib);
                               see DEFAULT_STACK_MIB
+  * test timeouts          -> multiplied for rows emulated on another
+                              architecture (--emulated-timeout-scale); see
+                              DEFAULT_EMULATED_TIMEOUT_SCALE
 
 Rows run on linux/arm64 (native under Colima) unless the row's steps need
 amd64 (see _AMD64_ONLY_RE) or the image has no arm64 variant.
@@ -349,6 +352,14 @@ CACHE_MARKER = ".stdexec-ci-cache-complete"
 # CI's own limit isn't known; this only needs to stop such tests failing
 # locally, and the limit reserves address space rather than memory.
 DEFAULT_STACK_MIB = 32
+
+# Rows emulated on another architecture (amd64 under Rosetta on an arm64 VM)
+# run their tests several times slower than CI does, and the slowest tests,
+# such as the Relacy model checks, then exceed their TIMEOUT properties.
+# ctest can only override the default timeout (--timeout), not a test's own
+# TIMEOUT property, so the ctest shim multiplies both, rewriting the TIMEOUT
+# properties in the build tree's generated test files.
+DEFAULT_EMULATED_TIMEOUT_SCALE = 4
 WORKSPACE = "/__w/stdexec/stdexec"
 
 SKIPPED_ACTIONS = {
@@ -593,7 +604,30 @@ if [[ "${STDEXEC_CI_BUILD_ONLY:-0}" == 1 ]]; then
   echo "stdexec-ci: build-only run; skipped: ctest $*" >&2
   exit 0
 fi
-exec "$(stdexec_ci_real ctest)" "$@"
+scale="${STDEXEC_CI_TIMEOUT_SCALE:-1}"
+if [[ "${scale}" == 1 ]]; then
+  exec "$(stdexec_ci_real ctest)" "$@"
+fi
+# Multiply --timeout, and the TIMEOUT properties in the generated test files
+# of the test directory (--test-dir, or the current directory).
+args=() dir=.
+while (( $# )); do
+  case "$1" in
+    --timeout)
+      if [[ $# -ge 2 ]]; then args+=(--timeout "$(( $2 * scale ))"); shift 2
+      else args+=("$1"); shift; fi ;;
+    --timeout=*) args+=("--timeout=$(( ${1#--timeout=} * scale ))"); shift ;;
+    --test-dir)
+      if [[ $# -ge 2 ]]; then dir="$2"; args+=("$1" "$2"); shift 2
+      else args+=("$1"); shift; fi ;;
+    --test-dir=*) dir="${1#--test-dir=}"; args+=("$1"); shift ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+find "${dir}" -type f \( -name CTestTestfile.cmake -o -name '*_tests*.cmake' \) \
+  -exec perl /opt/stdexec-ci/scale-timeouts.pl "${scale}" {} +
+echo "stdexec-ci: emulated row; test timeouts multiplied by ${scale}" >&2
+exec "$(stdexec_ci_real ctest)" "${args[@]}"
 """,
     "valgrind": r"""#!/bin/bash -p
 . /opt/stdexec-ci/shim-lib.sh
@@ -656,6 +690,26 @@ echo "stdexec-ci: cmake ${args[*]}  (parallelism capped at ${cap})" >&2
 exec "${real}" "${args[@]}"
 """,
 }
+
+
+# Multiplies the TIMEOUT properties in ctest's generated test files, in place.
+# CMake writes them as `TIMEOUT "120"`, Catch2's test discovery as
+# `TIMEOUT 30`.  A marker line keeps a file that the build hasn't regenerated
+# from being multiplied twice.
+SCALE_TIMEOUTS = r"""use strict;
+my $scale = shift @ARGV;
+my $marker = "# stdexec-ci: TIMEOUT properties multiplied\n";
+for my $file (@ARGV) {
+  open(my $in, "<", $file) or die "$file: $!";
+  my $text = do { local $/; <$in> };
+  close($in);
+  next if index($text, $marker) == 0;
+  $text =~ s/\bTIMEOUT(\s+)("?)(\d+(?:\.\d+)?)\2/"TIMEOUT$1$2" . ($3 * $scale) . $2/ge;
+  open(my $out, ">", $file) or die "$file: $!";
+  print $out $marker, $text;
+  close($out);
+}
+"""
 
 
 def _inject_overrides(script: str) -> str:
@@ -728,6 +782,7 @@ def build_bundle(plan: Plan, source_tar: bytes) -> bytes:
 
     add("local-overrides.sh", LOCAL_OVERRIDES)
     add("shim-lib.sh", SHIM_LIB)
+    add("scale-timeouts.pl", SCALE_TIMEOUTS)
     add("sccache.conf", "")
     for shim, text in SHIMS.items():
         add(f"shims/{shim}", text, 0o755)
@@ -815,7 +870,7 @@ class Result:
 
 
 def run_plan(plan: Plan, bundle: bytes, *, build_only: bool, log: Path | None,
-             verbose: bool, keep_failed: bool, stack_mib: int,
+             verbose: bool, keep_failed: bool, stack_mib: int, timeout_scale: int,
              extra_args: list[str]) -> str:
     cname = f"stdexec-ci-{_slug(plan.name)}-{os.getpid()}"
     args = ["create", "--name", cname, "--platform", plan.platform]
@@ -823,6 +878,7 @@ def run_plan(plan: Plan, bundle: bytes, *, build_only: bool, log: Path | None,
     args += ["-e", f"STDEXEC_CI_BUILD_ONLY={1 if build_only else 0}"]
     stack_bytes = stack_mib * 1024 * 1024
     args += ["--ulimit", f"stack={stack_bytes}:{stack_bytes}"]
+    args += ["-e", f"STDEXEC_CI_TIMEOUT_SCALE={timeout_scale}"]
     if os.environ.get("STDEXEC_CI_JOBS"):
         args += ["-e", f"STDEXEC_CI_JOBS={os.environ['STDEXEC_CI_JOBS']}"]
     args += ["-v", "stdexec-ci-sccache:/var/cache/stdexec-ci/sccache",
@@ -916,6 +972,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="auto: arm64 unless a row needs amd64; amd64: every row as CI runs it")
     ap.add_argument("--stack-mib", type=int, default=DEFAULT_STACK_MIB, metavar="MIB",
                     help="the containers' stack size limit (default: %(default)s; Docker's own is 8)")
+    ap.add_argument("--emulated-timeout-scale", type=int, default=DEFAULT_EMULATED_TIMEOUT_SCALE,
+                    metavar="N", help="multiply test timeouts by N in rows emulated on another "
+                                      "architecture (default: %(default)s)")
     ap.add_argument("-j", "--jobs", type=int,
                     help="cap on build parallelism (default: min(VM cpus, VM GiB / 2))")
     ap.add_argument("-v", "--verbose", action="store_true", help="stream build output to the terminal")
@@ -969,12 +1028,15 @@ def main(argv: list[str] | None = None) -> int:
     if not selected:
         ap.error("select rows with PATTERNs, --quick or --all (see --list)")
 
+    vm_arch = "arm64"  # assumed for --dry-run
     if not DRY_RUN:
         r = docker("info", check=False, quiet=True)
         if r.returncode != 0:
             ctx = os.environ.get("DOCKER_CONTEXT", "(default)")
             sys.exit(f"stdexec-ci: can't reach Docker (context {ctx}).\n"
                      "Start the VM by entering `devshell colima-docker` in another terminal.")
+        vm_arch = docker("version", "--format", "{{.Server.Arch}}",
+                         capture=True).stdout.decode().strip()
 
     plans = [make_plan(args.job, job, rows[i], platform_choice=args.platform,
                        probe_caches=not DRY_RUN) for i in selected]
@@ -1009,7 +1071,10 @@ def main(argv: list[str] | None = None) -> int:
             t0 = time.monotonic()
             status = run_plan(p, bundle, build_only=not args.test, log=log,
                               verbose=args.verbose, keep_failed=args.keep_failed,
-                              stack_mib=args.stack_mib, extra_args=args.docker_arg)
+                              stack_mib=args.stack_mib,
+                              timeout_scale=(1 if p.platform == f"linux/{vm_arch}"
+                                             else args.emulated_timeout_scale),
+                              extra_args=args.docker_arg)
             results.append(Result(p, status, time.monotonic() - t0, log))
             print(f"<<< {status} in {time.monotonic() - t0:.0f}s")
             if status == "FAILED" and args.fail_fast:
