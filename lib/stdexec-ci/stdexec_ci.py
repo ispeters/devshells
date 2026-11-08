@@ -18,6 +18,8 @@ local substitutions:
                               removed (see local-overrides.sh)
   * `cmake --build -j N`   -> N capped to what the VM can hold in memory
   * ctest / valgrind       -> skipped unless --test is given
+  * stack size limit       -> 32 MiB instead of Docker's 8 MiB (--stack-mib);
+                              see DEFAULT_STACK_MIB
 
 Rows run on linux/arm64 (native under Colima) unless the row's steps need
 amd64 (see _AMD64_ONLY_RE) or the image has no arm64 variant.
@@ -339,6 +341,14 @@ def cache_volume_complete(volume: str, image: str, platform: str) -> bool:
 
 BUNDLE = "/opt/stdexec-ci"
 CACHE_MARKER = ".stdexec-ci-cache-complete"
+
+# The containers' stack size limit, which glibc also uses as the default size
+# of new threads' stacks.  Docker's default of 8 MiB is too small for some
+# tests that pass in CI: under GCC 14 with ASAN at -O3, "repro for
+# NVIDIA/stdexec#2047 no stack overflow" needs 12 MiB on a thread-pool thread.
+# CI's own limit isn't known; this only needs to stop such tests failing
+# locally, and the limit reserves address space rather than memory.
+DEFAULT_STACK_MIB = 32
 WORKSPACE = "/__w/stdexec/stdexec"
 
 SKIPPED_ACTIONS = {
@@ -805,11 +815,14 @@ class Result:
 
 
 def run_plan(plan: Plan, bundle: bytes, *, build_only: bool, log: Path | None,
-             verbose: bool, keep_failed: bool, extra_args: list[str]) -> str:
+             verbose: bool, keep_failed: bool, stack_mib: int,
+             extra_args: list[str]) -> str:
     cname = f"stdexec-ci-{_slug(plan.name)}-{os.getpid()}"
     args = ["create", "--name", cname, "--platform", plan.platform]
     args += plan.options
     args += ["-e", f"STDEXEC_CI_BUILD_ONLY={1 if build_only else 0}"]
+    stack_bytes = stack_mib * 1024 * 1024
+    args += ["--ulimit", f"stack={stack_bytes}:{stack_bytes}"]
     if os.environ.get("STDEXEC_CI_JOBS"):
         args += ["-e", f"STDEXEC_CI_JOBS={os.environ['STDEXEC_CI_JOBS']}"]
     args += ["-v", "stdexec-ci-sccache:/var/cache/stdexec-ci/sccache",
@@ -901,6 +914,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--test", action="store_true", help="also run the tests (ctest, valgrind)")
     ap.add_argument("--platform", choices=["auto", "amd64"], default="auto",
                     help="auto: arm64 unless a row needs amd64; amd64: every row as CI runs it")
+    ap.add_argument("--stack-mib", type=int, default=DEFAULT_STACK_MIB, metavar="MIB",
+                    help="the containers' stack size limit (default: %(default)s; Docker's own is 8)")
     ap.add_argument("-j", "--jobs", type=int,
                     help="cap on build parallelism (default: min(VM cpus, VM GiB / 2))")
     ap.add_argument("-v", "--verbose", action="store_true", help="stream build output to the terminal")
@@ -994,7 +1009,7 @@ def main(argv: list[str] | None = None) -> int:
             t0 = time.monotonic()
             status = run_plan(p, bundle, build_only=not args.test, log=log,
                               verbose=args.verbose, keep_failed=args.keep_failed,
-                              extra_args=args.docker_arg)
+                              stack_mib=args.stack_mib, extra_args=args.docker_arg)
             results.append(Result(p, status, time.monotonic() - t0, log))
             print(f"<<< {status} in {time.monotonic() - t0:.0f}s")
             if status == "FAILED" and args.fail_fast:
