@@ -2,6 +2,7 @@
 let
   mkClangDevShell = import ../lib/mk-clang-dev-shell.nix { inherit pkgs; };
   mkLlvmReleaseTool = import ../lib/mk-llvm-release-tool.nix { inherit pkgs; };
+  stdexec-ci = import ../lib/stdexec-ci { inherit pkgs; };
 
   clang-format-21_1_5 = mkLlvmReleaseTool {
     tool = "clang-format";
@@ -29,6 +30,7 @@ mkClangDevShell {
     lldb
     ninja
     pythonEnv
+    stdexec-ci
   ];
   extraShellHook = ''
     export STDEXEC_LIBCLANG="${llvmPackages.libclang.lib}/lib/libclang.dylib"
