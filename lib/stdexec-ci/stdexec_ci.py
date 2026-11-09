@@ -26,6 +26,18 @@ local substitutions:
 
 Rows run on linux/arm64 (native under Colima) unless the row's steps need
 amd64 (see _AMD64_ONLY_RE) or the image has no arm64 variant.
+
+To run something other than CI's own build, such as one example:
+
+  * --target T             -> every `cmake --build` builds only T (repeatable),
+                              instead of the targets the step names
+  * --then CMD             -> after the job, runs CMD in the configured tree
+                              (THEN_DIR) as the build step's user, with its
+                              environment; CMD's output is shown even without
+                              --verbose
+
+e.g. stdexec-ci "gcc 14, Release, ASAN" --target example.hello_world \
+         --then build/examples/example.hello_world
 """
 
 from __future__ import annotations
@@ -549,6 +561,31 @@ def make_plan(job_id: str, job: dict[str, Any], row: dict[str, Any], *,
     return Plan(row, name, image, platform, reason, options, ops, mounts, allow_failure)
 
 
+# Where --then commands run: the build step copies the checkout to the
+# container user's home as `stdexec` and configures it in `build/` there.
+THEN_DIR = "~/stdexec"
+THEN_STEP_NAME = "--then command"
+
+
+def build_op_index(plan: Plan) -> int:
+    """The index of the job's build step, taken to be its last `run:` step;
+    the steps before it set up the row's environment."""
+    for i in range(len(plan.ops) - 1, -1, -1):
+        if plan.ops[i].kind == "run":
+            return i
+    raise ExprError(f"{plan.name}: the job has no `run:` step")
+
+
+def add_then(plan: Plan, command: str) -> None:
+    """Append a step that runs command in THEN_DIR the way the build step
+    runs: same shell (and so the same user), working directory and step
+    environment, with the image's login profile sourced as the build step
+    does."""
+    build = plan.ops[build_op_index(plan)]
+    script = f"set -e\nsource /etc/profile\ncd {THEN_DIR}\n{command}\n"
+    plan.ops.append(Op("run", THEN_STEP_NAME, {**build.data, "script": script}))
+
+
 # --------------------------------------------------------------------------
 # Bundle: the files copied into the container before it starts
 # --------------------------------------------------------------------------
@@ -641,6 +678,10 @@ exec "$(stdexec_ci_real valgrind)" "$@"
     # just exhausts the VM's memory, so cap the parallelism of every
     # `cmake --build` (and supply the cap when none is given, since ninja's
     # default of nproc+2 can also be too many for heavy template TUs).
+    #
+    # With --target, STDEXEC_CI_TARGETS replaces the targets of every
+    # `cmake --build`, including builds of specific targets such as the
+    # header-set check, which then just rebuild the requested targets.
     "cmake": r"""#!/bin/bash -p
 . /opt/stdexec-ci/shim-lib.sh
 real="$(stdexec_ci_real cmake)" || exit 127
@@ -655,6 +696,7 @@ if [[ "${cap}" == auto ]]; then
   (( by_mem < cap )) && cap=${by_mem}
   (( cap < 1 )) && cap=1
 fi
+targets="${STDEXEC_CI_TARGETS:-}"
 args=() saw_j=0
 while (( $# )); do
   case "$1" in
@@ -672,18 +714,35 @@ while (( $# )); do
       n="${1#-j}"; n="${n#--parallel=}"; shift
       (( n > cap )) && n=${cap}
       args+=(-j "${n}") ;;
+    -t|--target)
+      # --target takes one or more names.
+      if [[ -n "${targets}" ]]; then
+        shift
+        while (( $# )) && [[ "$1" != -* ]]; do shift; done
+      else
+        args+=("$1"); shift
+      fi ;;
+    --target=*)
+      [[ -n "${targets}" ]] || args+=("$1")
+      shift ;;
     --) args+=("$@"); break ;;
     *) args+=("$1"); shift ;;
   esac
 done
-if (( ! saw_j )); then
+extra=()
+(( saw_j )) || extra+=(-j "${cap}")
+if [[ -n "${targets}" ]]; then
+  read -ra target_list <<< "${targets}"
+  extra+=(--target "${target_list[@]}")
+fi
+if (( ${#extra[@]} )); then
   # Options after `--` go to the native tool, so insert ours before it.
   out=() inserted=0
   for a in "${args[@]}"; do
-    if [[ "$a" == -- && ${inserted} == 0 ]]; then out+=(-j "${cap}"); inserted=1; fi
+    if [[ "$a" == -- && ${inserted} == 0 ]]; then out+=("${extra[@]}"); inserted=1; fi
     out+=("$a")
   done
-  (( inserted )) || out+=(-j "${cap}")
+  (( inserted )) || out+=("${extra[@]}")
   args=("${out[@]}")
 fi
 echo "stdexec-ci: cmake ${args[*]}  (parallelism capped at ${cap})" >&2
@@ -870,7 +929,7 @@ class Result:
 
 
 def create_container(plan: Plan, bundle: bytes, *, build_only: bool, stack_mib: int,
-                     timeout_scale: int, extra_args: list[str]) -> str:
+                     timeout_scale: int, targets: list[str], extra_args: list[str]) -> str:
     """Create (but don't start) a container for the plan's row, with the
     bundle copied in and the driver as its command.  Returns its name."""
     cname = f"stdexec-ci-{_slug(plan.name)}-{os.getpid()}"
@@ -882,6 +941,8 @@ def create_container(plan: Plan, bundle: bytes, *, build_only: bool, stack_mib: 
     args += ["-e", f"STDEXEC_CI_TIMEOUT_SCALE={timeout_scale}"]
     if os.environ.get("STDEXEC_CI_JOBS"):
         args += ["-e", f"STDEXEC_CI_JOBS={os.environ['STDEXEC_CI_JOBS']}"]
+    if targets:
+        args += ["-e", "STDEXEC_CI_TARGETS=" + " ".join(targets)]
     args += ["-v", "stdexec-ci-sccache:/var/cache/stdexec-ci/sccache",
              "-v", "stdexec-ci-cpm:/var/cache/stdexec-ci/cpm"]
     for vol, path in plan.mounts:
@@ -906,34 +967,43 @@ def create_container(plan: Plan, bundle: bytes, *, build_only: bool, stack_mib: 
     return cname
 
 
-def stream(cmd: list[str], log: Path, *, verbose: bool) -> int:
-    """Run cmd, writing its combined output to log (and to stdout when
-    verbose).  Returns its exit status."""
+def stream(cmd: list[str], log: Path, *, verbose: bool,
+           echo_from: bytes | None = None) -> tuple[int, bool]:
+    """Run cmd, writing its combined output to log, and to stdout when
+    verbose or from the first line containing echo_from on.  Returns its exit
+    status and whether it echoed anything."""
+    echoing = verbose
     with open(log, "wb") as lf:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         assert proc.stdout is not None
         for chunk in iter(lambda: proc.stdout.readline(), b""):
             lf.write(chunk)
-            if verbose:
+            if not echoing and echo_from is not None and echo_from in chunk:
+                echoing = True
+            if echoing:
                 sys.stdout.buffer.write(chunk)
                 sys.stdout.flush()
-        return proc.wait()
+        return proc.wait(), echoing
 
 
 def run_plan(plan: Plan, bundle: bytes, *, build_only: bool, log: Path | None,
              verbose: bool, keep_failed: bool, stack_mib: int, timeout_scale: int,
-             extra_args: list[str]) -> str:
+             targets: list[str], extra_args: list[str]) -> str:
     cname = create_container(plan, bundle, build_only=build_only, stack_mib=stack_mib,
-                             timeout_scale=timeout_scale, extra_args=extra_args)
+                             timeout_scale=timeout_scale, targets=targets,
+                             extra_args=extra_args)
     status: str | None = None
     try:
         if DRY_RUN:
             docker("start", "-a", cname)
             return "dry-run"
         assert log is not None
-        rc = stream(["docker", "start", "-a", cname], log, verbose=verbose)
+        # The driver's banner for the --then step starts the echo, so its
+        # output shows without --verbose.
+        rc, echoed = stream(["docker", "start", "-a", cname], log, verbose=verbose,
+                            echo_from=f"stdexec-ci: {THEN_STEP_NAME}".encode())
         status = "passed" if rc == 0 else ("failed (allowed)" if plan.allow_failure else "FAILED")
-        if rc != 0 and not verbose:
+        if rc != 0 and not echoed:
             tail = log.read_bytes().splitlines()[-40:]
             print("    ... last lines of the log:")
             for line in tail:
@@ -986,6 +1056,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("-q", "--quick", action="store_true",
                     help="run one row per distinct toolchain (image + from-source compiler)")
     ap.add_argument("--test", action="store_true", help="also run the tests (ctest, valgrind)")
+    ap.add_argument("-t", "--target", action="append", default=[], metavar="TARGET",
+                    help="build only TARGET, in place of the targets of every `cmake --build` "
+                         "(repeatable)")
+    ap.add_argument("--then", metavar="CMD",
+                    help=f"after the job, run the shell command CMD in {THEN_DIR} as the build "
+                         "step's user, with its environment; its output is shown even "
+                         "without --verbose")
     ap.add_argument("--platform", choices=["auto", "amd64"], default="auto",
                     help="auto: arm64 unless a row needs amd64; amd64: every row as CI runs it")
     ap.add_argument("--stack-mib", type=int, default=DEFAULT_STACK_MIB, metavar="MIB",
@@ -1058,12 +1135,17 @@ def main(argv: list[str] | None = None) -> int:
 
     plans = [make_plan(args.job, job, rows[i], platform_choice=args.platform,
                        probe_caches=not DRY_RUN) for i in selected]
+    if args.then:
+        for p in plans:
+            add_then(p, args.then)
     # Run rows grouped by (image, platform): the classic Docker image store
     # keeps one platform per tag, so alternating platforms re-pulls images.
     order = sorted(range(len(plans)), key=lambda k: (plans[k].image, plans[k].platform, k))
 
     print(f"stdexec-ci: {len(plans)} row(s) from {args.workflow}:{args.job}, "
-          f"{'build and test' if args.test else 'build only'}")
+          f"{'build and test' if args.test else 'build only'}"
+          + (f", targets: {' '.join(args.target)}" if args.target else "")
+          + (f", then: {args.then}" if args.then else ""))
     for p in plans:
         print(f"  - {p.name}  [{p.platform.split('/')[1]}: {p.platform_reason}]")
 
@@ -1092,7 +1174,7 @@ def main(argv: list[str] | None = None) -> int:
                               stack_mib=args.stack_mib,
                               timeout_scale=(1 if p.platform == f"linux/{vm_arch}"
                                              else args.emulated_timeout_scale),
-                              extra_args=args.docker_arg)
+                              targets=args.target, extra_args=args.docker_arg)
             results.append(Result(p, status, time.monotonic() - t0, log))
             print(f"<<< {status} in {time.monotonic() - t0:.0f}s")
             if status == "FAILED" and args.fail_fast:
