@@ -869,9 +869,10 @@ class Result:
     log: Path | None
 
 
-def run_plan(plan: Plan, bundle: bytes, *, build_only: bool, log: Path | None,
-             verbose: bool, keep_failed: bool, stack_mib: int, timeout_scale: int,
-             extra_args: list[str]) -> str:
+def create_container(plan: Plan, bundle: bytes, *, build_only: bool, stack_mib: int,
+                     timeout_scale: int, extra_args: list[str]) -> str:
+    """Create (but don't start) a container for the plan's row, with the
+    bundle copied in and the driver as its command.  Returns its name."""
     cname = f"stdexec-ci-{_slug(plan.name)}-{os.getpid()}"
     args = ["create", "--name", cname, "--platform", plan.platform]
     args += plan.options
@@ -897,23 +898,40 @@ def run_plan(plan: Plan, bundle: bytes, *, build_only: bool, log: Path | None,
             if docker("image", "inspect", plan.image, check=False, quiet=True).returncode != 0:
                 raise RuntimeError(f"can't pull {plan.image} for {plan.platform}")
     docker(*args, quiet=True)
-    status: str | None = None
     try:
         docker("cp", "-", f"{cname}:/", stdin=bundle)
+    except BaseException:
+        docker("rm", "-f", cname, check=False, quiet=True)
+        raise
+    return cname
+
+
+def stream(cmd: list[str], log: Path, *, verbose: bool) -> int:
+    """Run cmd, writing its combined output to log (and to stdout when
+    verbose).  Returns its exit status."""
+    with open(log, "wb") as lf:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        assert proc.stdout is not None
+        for chunk in iter(lambda: proc.stdout.readline(), b""):
+            lf.write(chunk)
+            if verbose:
+                sys.stdout.buffer.write(chunk)
+                sys.stdout.flush()
+        return proc.wait()
+
+
+def run_plan(plan: Plan, bundle: bytes, *, build_only: bool, log: Path | None,
+             verbose: bool, keep_failed: bool, stack_mib: int, timeout_scale: int,
+             extra_args: list[str]) -> str:
+    cname = create_container(plan, bundle, build_only=build_only, stack_mib=stack_mib,
+                             timeout_scale=timeout_scale, extra_args=extra_args)
+    status: str | None = None
+    try:
         if DRY_RUN:
             docker("start", "-a", cname)
             return "dry-run"
         assert log is not None
-        with open(log, "wb") as lf:
-            proc = subprocess.Popen(["docker", "start", "-a", cname],
-                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-            assert proc.stdout is not None
-            for chunk in iter(lambda: proc.stdout.readline(), b""):
-                lf.write(chunk)
-                if verbose:
-                    sys.stdout.buffer.write(chunk)
-                    sys.stdout.flush()
-            rc = proc.wait()
+        rc = stream(["docker", "start", "-a", cname], log, verbose=verbose)
         status = "passed" if rc == 0 else ("failed (allowed)" if plan.allow_failure else "FAILED")
         if rc != 0 and not verbose:
             tail = log.read_bytes().splitlines()[-40:]
